@@ -1,0 +1,22 @@
+# Small, editable legal-domain syllable vocabulary, NOT a complete Vietnamese dictionary.
+# One or more lowercase syllables per line; names and identifiers are intentionally absent.
+án ánh anh bà bản bán bảo báo bằng bị biên bồi
+bố bộ buộc các cách cáo cấp cầm căn căn cắt cần chấp
+cha chỉ chi chia chính cho chủ chứng chưa chồng chỗ
+có còn công con cộng cơ của cứ cứu cử cư cùng cuộc
+dân danh dành dịch diễn diện định đình do đơn đồng đủ đòi
+đã đang đầu đến điều điểm điện điền được đúng đối đóng đất đương đền
+gia giá giải giao giám giấy gốc gửi giam giữ hạn hành
+hạnh hàng hại hình hòa hoàn hợp họ hộ hỏi hồi hưởng
+hiện kháng khác khách khai khoản khoảng khởi không khi kiện kiểm
+kết kinh lao luật lập lại làm lệ lợi liên lãi lý lực
+lời lần mất một mọi mở người nguyên ngày nhận nhân như
+nội nghĩa nghị nghiện nghiên nhiên nợ nơi nuôi nước năm nữa
+pháp phần phạm phán phản phải phạt phí phía phù phúc phương phiên
+quan quận quá quyền quyết quy quả quản quy định
+rút riêng ra sát sơ số sự sở sửa sai sau sinh sản sức sử dụng
+tài tại tái tạm tặng thanh tháng thẩm thấy thực thuận thường
+thương thủ thu thừa thi thị thiết thời tiền tình tích tịch toàn
+tòa toà tố tụng tính tuổi tuyên tuyển tước trả trên tranh trình trong trộm
+trước trường trầm trọng trị triệu trợ tự từ tư vụ việc vì về văn
+vay và vợ với vi viện việt vị vô xử xét xã xác xin xong yêu

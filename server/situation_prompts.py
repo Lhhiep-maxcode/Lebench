@@ -236,10 +236,7 @@ def build_writer_messages(judgment, previous_situation=None, feedback=None):
 def build_judge_messages(judgment, situation, citations_law=None):
     payload = {'judgment': judgment, 'situation': situation}
     if citations_law is not None:
-        # Keep reference metadata, never arbitrary input fields or prior verdicts.
-        fields = ('ref', 'law_type', 'law_name', 'id', 'year', 'article', 'chapter', 'section', 'clause', 'point')
         citations = citations_law if isinstance(citations_law, list) else []
-        payload['citations_law'] = [{key: item[key] for key in fields if key in item}
-                                    for item in citations if isinstance(item, dict)]
+        payload['citations_law'] = list({tuple(citation.items()): citation for citation in citations}.values())  # deduplicate by content
     return [{'role': 'system', 'content': JUDGE_SYSTEM_PROMPT},
             {'role': 'user', 'content': JUDGE_USER_PROMPT+INPUT_SEPARATOR+json.dumps(payload, ensure_ascii=False)}]

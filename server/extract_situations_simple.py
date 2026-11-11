@@ -11,8 +11,10 @@ import httpx
 from tqdm import tqdm
 
 if __package__:
+    from .extract_situations_rules import strip_page_markers
     from .situation_prompts import build_judge_messages, build_writer_messages
 else:
+    from extract_situations_rules import strip_page_markers
     from situation_prompts import build_judge_messages, build_writer_messages
 
 
@@ -52,6 +54,7 @@ async def extract_one(row, client, args):
         source = row.get('markdown')
         if not isinstance(source, str) or not source.strip():
             raise ValueError('markdown is missing or empty')
+        source = strip_page_markers(source)
         for attempt in range(args.max_retries+1):
             writer_messages = build_writer_messages(source, situation, verdict['feedback'] if verdict else None)
             attempts = attempt+1
