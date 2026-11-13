@@ -1,280 +1,339 @@
-"""Extract judgment sections by headings, with optional, logged OCR word repairs."""
+"""Extract facts, application and conclusion from judgments using heading rules."""
 
 import argparse
-import difflib
 import json
+import multiprocessing as mp
+import os
 import re
 import sys
 import unicodedata
 from collections import Counter
-from functools import lru_cache
+from datetime import date
+from itertools import islice
 from pathlib import Path
 
+from tqdm import tqdm
 
-# Edit this small predefined vocabulary to support another judgment template.
+
 HEADINGS = {
-    'NỘI DUNG VỤ ÁN': 'content',
-    'NỘI DUNG CỦA VỤ ÁN': 'content',
-    'NỘI DUNG VỤ VIỆC': 'content',
-    'NỘI DUNG VIỆC DÂN SỰ': 'content',
-    'NỘI DUNG VIỆC HÔN NHÂN VÀ GIA ĐÌNH': 'content',
-    'NHỮNG VẤN ĐỀ CỤ THỂ YÊU CẦU TÒA ÁN GIẢI QUYẾT': 'content',
-    'NHỮNG VẤN ĐỀ YÊU CẦU TÒA ÁN GIẢI QUYẾT': 'content',
+    'NỘI DUNG VỤ ÁN': 'facts',
+    'NỘI DUNG CỦA VỤ ÁN': 'facts',
+    'NỘI DUNG VỤ VIỆC': 'facts',
+    'NỘI DUNG VIỆC DÂN SỰ': 'facts',
+    'NỘI DUNG VIỆC HÔN NHÂN VÀ GIA ĐÌNH': 'facts',
+    'NHỮNG VẤN ĐỀ CỤ THỂ YÊU CẦU TÒA ÁN GIẢI QUYẾT': 'facts',
+    'NHỮNG VẤN ĐỀ YÊU CẦU TÒA ÁN GIẢI QUYẾT': 'facts',
     'NHẬN THẤY': 'facts',
-    'XÉT THẤY': 'consideration',
-    'NHẬN ĐỊNH CỦA HỘI ĐỒNG XÉT XỬ': 'reasoning',
-    'NHẬN ĐỊNH CỦA TÒA ÁN': 'reasoning',
-    'NHẬN ĐỊNH NHƯ SAU': 'reasoning',
-    'NHẬN ĐỊNH': 'reasoning',
+    'XÉT THẤY': 'application',
+    'NHẬN ĐỊNH CỦA HỘI ĐỒNG XÉT XỬ': 'application',
+    'NHẬN ĐỊNH CỦA TÒA ÁN': 'application',
+    'NHẬN ĐỊNH NHƯ SAU': 'application',
+    'NHẬN ĐỊNH': 'application',
     'QUYẾT ĐỊNH': 'decision',
 }
-PAGE_MARKER = re.compile(r'(?i)#{2,6}[ \t]*Page[ \t]*(?:\{[ \t]*)?\d+(?:[ \t]*/[ \t]*\d+)*(?:[ \t]*\})?(?![\w/])')
-WORD = re.compile(r'(?<!\w)[^\W\d_]+(?!\w)', re.UNICODE)
-# A permissive syllable shape protects valid words absent from the vocabulary.
-VIETNAMESE_SYLLABLE = re.compile(r'(?:ngh|ng|nh|ph|th|tr|ch|kh|gh|gi|qu|[bcdghklmnpqrstvx])?[aeiouy]+(?:ch|nh|ng|[cmnpt])?\Z')
+PAGE_MARKER = re.compile(
+    r'(?i)#{2,6}[ \t]*Page[ \t]*(?:\{[ \t]*)?\d+(?:[ \t]*/[ \t]*\d+)*(?:[ \t]*\})?(?![\w/])'
+)
+# A wrapped PDF line is not necessarily a new paragraph. Also split at a new
+# line following sentence/list punctuation, since PDF text often has no blank lines.
+PARAGRAPH_BREAK = re.compile(r'\r?\n[ \t\r]*\n|[.!?;:]["”\')\]]*[ \t\r]*\n[ \t]*')
+# Explicit aliases keep OCR matching limited to prosecutor names, not arbitrary words.
+PROSECUTOR_NAMES = (
+    'Viện kiểm sát', 'Vện kiểm sát', 'Việm kiểm sát', 'Vịn kiểm sát',
+    'Viện kiểm xát', 'Viện kiểm soát', 'Vlen kiểm sát', 'Viện klem sát',
+    'V1ện k1ểm sát', 'Viện KS', 'Viện KSND',
+    'Kiểm sát viên', 'Kiểm sát vên', 'VKS', 'VKSND', 'VKSNDTC', 'VKSNDCC', 'VKSTC', 'KSV',
+)
+OPINION = re.compile(
+    r'phatbieu|ykien|quandiem|chorang|'
+    r'denghi|kiennghi|dexuat|luantoi|ketluan|giunguyenquandiem|giunguyenquyetdinhtruyto'
+)
+OPINION_PREFIX = re.compile(
+    r'(?:ykien(?:phatbieu)?|quandiem|phatbieu)(?:cua)?(?:nguoi|vi)?(?:daidien)?$'
+)
+FOOTER = re.compile(
+    r'(?m)^[ \t#*]*(?:noi\s+nhan\b|t\.?\s*m\.?\s*hoi\s+dong\b|'
+    r'tham\s+phan(?:\s*[-–]\s*chu\s+toa[^\n]*)?[ \t:*#]*$)'
+)
+DATE_PATTERN = re.compile(
+    r'\bn\s*g\s*a\s*y\s*:?\s*(\d{1,2})\s*(?:t\s*h\s*a\s*n\s*g|[/\.–—-])\s*'
+    r'(\d{1,2})\s*(?:n\s*a\s*m|[/\.–—-])\s*(\d(?:[ \t]*\d){3})(?!\d)'
+)
 
 
 def fold(text):
     text = unicodedata.normalize('NFKD', text.lower().replace('đ', 'd'))
-    return ''.join(c for c in text if not unicodedata.combining(c))
+    return ''.join(char for char in text if not unicodedata.combining(char))
 
 
-def compact(text):
-    return re.sub('[^a-z]', '', fold(text))
+def phrase_pattern(names):
+    """Allow case/accent differences, OCR spaces and dotted abbreviations."""
+    keys = {re.sub(r'\s+', '', fold(name)) for name in names}
+    return re.compile('|'.join(
+        r'\b' + r'[\s.]*'.join(re.escape(char) for char in key) + r'\b'
+        for key in sorted(keys, key=lambda key: (-len(key), key))
+    ))
 
 
-def load_vocabulary(path):
-    # Viet74K includes multiword entries; the OCR corrector operates on syllables.
-    return {word for line in path.read_text(encoding='utf-8-sig').splitlines()
-            for word in unicodedata.normalize('NFC', line.partition('#')[0]).lower().split()
-            if WORD.fullmatch(word)}
+PROSECUTOR = phrase_pattern(PROSECUTOR_NAMES)
+FINAL_STATEMENT = phrase_pattern(('lời nói sau cùng', 'lời sau cùng', 'lời cuối cùng', 'lời nói cuối cùng'))
+
+
+def is_criminal(category):
+    return isinstance(category, str) and category.strip().casefold() == 'criminal'
+
+
+def paragraph_spans(text):
+    """Keep original offsets, including wrapped final-statement headings and bodies."""
+    spans, start = [], 0
+    for boundary in PARAGRAPH_BREAK.finditer(text):
+        end = boundary.start() + (1 if text[boundary.start()] in '.!?;:' else 0)
+        if text[start:end].strip():
+            spans.append((start, end))
+        start = boundary.end()
+    if text[start:].strip():
+        spans.append((start, len(text)))
+    merged = []
+    for start, end in spans:
+        if merged:
+            previous = fold(text[merged[-1][0]:merged[-1][1]])
+            marker = FINAL_STATEMENT.search(previous)
+            # "Lời nói sau cùng:\nBị cáo ..." is one statement, not two paragraphs.
+            if marker and not previous[marker.end():].strip(' \t\r\n:*#.;'):
+                merged[-1] = (merged[-1][0], end)
+                continue
+        merged.append((start, end))
+    return merged
+
+
+def shadow_with_positions(text):
+    """Normalize only for matching; offsets still point to the original text."""
+    letters, positions = [], []
+    for index, char in enumerate(text):
+        folded = fold(char)
+        letters.extend(folded)
+        positions.extend([index] * len(folded))
+    return ''.join(letters), positions
 
 
 def strip_page_markers(text):
-    # Use a newline, not an empty string, so words on adjacent pages do not join.
+    # Also imported by extract_situations_simple.py.
     return PAGE_MARKER.sub('\n', text)
 
 
+HEADING_NAMES = sorted(HEADINGS, key=len, reverse=True)
+HEADING_PATTERN = re.compile(r'\b(?:' + '|'.join(
+    f'(?P<h{i}>' + r'\s*'.join(re.escape(word) for word in fold(name).split()) + ')'
+    for i, name in enumerate(HEADING_NAMES)
+) + r')\b')
+
+
 def find_headings(text):
-    # Search an accent-insensitive shadow; retain positions in the ORIGINAL text.
-    shadow, positions = [], []
-    for i, char in enumerate(text):
-        for letter in fold(char):   # fold("NHẬN ĐỊNH CỦA TÒA ÁN") -> "nhan dinh cua toa an"
-            shadow.append(letter)
-            positions.append(i)     # positions[i] = index of the original char in text
-    shadow = ''.join(shadow)
-    names = list(HEADINGS)
-    patterns = [r'\s*'.join(re.escape(w) for w in fold(name).split()) for name in names] # regex for each heading
-    pattern = r'\b(?:'+ '|'.join(f'(?P<h{i}>{p})' for i, p in enumerate(patterns))+r')\b' # Combine all heading patterns
-    found = []
-    for match in re.finditer(pattern, shadow):
-        start, end = positions[match.start()], positions[match.end()-1]+1
+    """Match the listed aliases, tolerating case, accents and whitespace only."""
+    shadow, positions = shadow_with_positions(text)
+    headings = []
+    for match in HEADING_PATTERN.finditer(shadow):
+        start = positions[match.start()]
+        end = positions[match.end() - 1] + 1
         while end < len(text) and unicodedata.combining(text[end]):
             end += 1
-        name = names[int(match.lastgroup[1:])]
-        prefix = text[text.rfind('\n', 0, start)+1:start]
+        name = HEADING_NAMES[int(match.lastgroup[1:])]
+        prefix = text[text.rfind('\n', 0, start) + 1:start]
         line_end = text.find('\n', end)
         suffix = text[end:line_end if line_end >= 0 else len(text)]
         at_line_start = not re.sub(r'[\s#*\d\[\]().:–-]', '', prefix)
         standalone = not suffix.strip(' \t\r:*#.;')
         colon = suffix.lstrip(' \t*').startswith(':')
         upper = text[start:end].isupper()
-        # Avoid treating prose such as "quyết định số ..." as a section boundary.
         if HEADINGS[name] == 'decision':
-            valid = ((at_line_start and standalone) or (colon and (upper or at_line_start))
-                     or (upper and bool(re.match(r'\s*1[.)]', suffix))))
+            valid = ((at_line_start and standalone)
+                     or (colon and (upper or at_line_start))
+                     or (upper and bool(re.match(r'\s*(?:1|I)[.)]', suffix))))
         else:
-            valid = (at_line_start and (colon or standalone or HEADINGS[name] in ('facts', 'consideration'))) or upper
+            valid = (at_line_start and (standalone or colon)) or upper
         if valid:
-            found.append({'start': start, 'end': end, 'heading': name, 'fuzzy': False})
-
-    # Fuzzy matching is restricted to short uppercase labels, never arbitrary prose.
-    # {
-    #     "noidungvuan": "NỘI DUNG VỤ ÁN",
-    #     "nhandinhcuatoaan": "NHẬN ĐỊNH CỦA TÒA ÁN",
-    #     "quyetdinh": "QUYẾT ĐỊNH",
-    #     ...
-    # }
-    lookup = {compact(name): name for name in names}    # compact() lowercases, removes accents, and keeps only letters a–z.
-    excluded = {'nhandanh', 'nhanthan', 'quydinh'}  # Real words, not OCR errors.
-    offset = 0
-    for line in text.splitlines(keepends=True):
-        label = line.split(':', 1)[0].strip(' \t\r\n#*0123456789[].)-–')
-        key = compact(label)
-        if (label.isupper() and 5 <= len(key) <= 55 and key not in excluded
-                and not key.startswith(('ve', 'toaan')) and key not in lookup):
-            matches = difflib.get_close_matches(key, lookup, n=2, cutoff=0.80)
-            if matches:
-                score = lambda k: difflib.SequenceMatcher(None, key, k).ratio()
-                if len(matches) == 1 or score(matches[0])-score(matches[1]) >= 0.08:
-                    start = offset+line.index(label)
-                    if not any(h['start'] <= start < h['end'] for h in found):
-                        found.append({'start': start, 'end': start+len(label),
-                                      'heading': lookup[matches[0]], 'fuzzy': True})
-        offset += len(line)
-    return sorted(found, key=lambda h: h['start'])
+            headings.append({'start': start, 'end': end, 'heading': name, 'role': HEADINGS[name]})
+    return headings
 
 
-def extract_section(text):
+def is_prosecutor_opinion(paragraph):
+    # Removing whitespace also recognizes OCR splits such as "phát bi ểu ý ki ến".
+    shadow = fold(paragraph)
+    for actor in PROSECUTOR.finditer(shadow):
+        before = re.sub(r'\s+', '', shadow[max(0, actor.start() - 180):actor.start()])[-70:]
+        after = re.sub(r'\s+', '', shadow[actor.end():actor.end() + 650])[:250]
+        if OPINION_PREFIX.search(before) or OPINION.search(after):
+            return True
+    return False
+
+
+def clean_facts(facts, category=None):
+    """Remove prosecutor material; Criminal cases can resume at the final statement."""
+    criminal = is_criminal(category)
+    paragraphs = paragraph_spans(facts)
+    for index, (start, end) in enumerate(paragraphs):
+        paragraph = facts[start:end]
+        detected = PROSECUTOR.search(fold(paragraph)) if criminal else is_prosecutor_opinion(paragraph)
+        if not detected:
+            continue
+        prefix = facts[:start].rstrip()
+        if criminal:
+            resume = next((left for left, right in paragraphs[index:]
+                           if FINAL_STATEMENT.search(fold(facts[left:right]))), None)
+            if resume is not None:
+                if resume == start:
+                    return facts
+                tail = facts[resume:].lstrip()
+                return '\n\n'.join(part for part in (prefix, tail) if part)
+        return prefix
+    return facts
+
+
+def filter_extracted(row):
+    """Reject empty clean facts or remaining prosecutor-name variants."""
+    seed = row.get('benchmark_seed') if isinstance(row, dict) else None
+    facts_clean = seed.get('facts_clean') if isinstance(seed, dict) else None
+    if not isinstance(facts_clean, str):
+        return None, 'invalid_input'
+    if not facts_clean.strip():
+        return None, 'empty_facts_clean'
+    criminal = is_criminal(row.get('category'))
+    for start, end in paragraph_spans(facts_clean):
+        paragraph = fold(facts_clean[start:end])
+        if PROSECUTOR.search(paragraph) and not (criminal and FINAL_STATEMENT.search(paragraph)):
+            return None, 'prosecutor_in_facts_clean'
+    return row, 'kept'
+
+
+def extract_judgment_date(header):
+    """Prefer a caption date, then an explicit current hearing date; never use a case-filing date."""
+    shadow = fold(header)
+    intro = re.search(r'\bnhan\s+danh\b|\bthanh\s+phan\b|\bhoi\s+dong\s+xet\s+xu\b', shadow)
+    caption_end = intro.start() if intro else len(shadow)
+    caption_dates, hearing_dates = set(), set()
+    for match in DATE_PATTERN.finditer(shadow):
+        day, month, year = (int(re.sub(r'\s+', '', value)) for value in match.groups())
+        try:
+            value = date(year, month, day).isoformat()
+        except ValueError:
+            continue
+        prefix = shadow[shadow.rfind('\n', 0, match.start()) + 1:match.start()]
+        line_end = shadow.find('\n', match.end())
+        suffix = shadow[match.end():line_end if line_end >= 0 else len(shadow)]
+        caption_prefix = not prefix.strip(' \t\r#*') or re.search(r'[^\n\d,]{2,100},[ \t]*$', prefix)
+        caption_suffix = not suffix.strip(' \t\r.,;:*#') or re.match(
+            r'\s*(?:quyet\s+dinh|nhan\s+danh|v/v)\b', suffix)
+        if match.start() < caption_end and caption_prefix and caption_suffix:
+            caption_dates.add(value)
+        following = shadow[match.end():match.end() + 300]
+        hearing = re.search(r'\bxet\s*x\s*u\b|\bmo\s*phien\s*hop\b', following)
+        if (re.match(r'\s*,?\s*(?:tai|toa\s*an)\b', following) and hearing
+                and not re.search(r'\b(?:noi\s*cu\s*tru|tien\s*an|thu\s*ly)\b', following[:hearing.start()])):
+            hearing_dates.add(value)
+    if caption_dates:
+        return next(iter(caption_dates)) if len(caption_dates) == 1 else None
+    return next(iter(hearing_dates)) if len(hearing_dates) == 1 else None
+
+
+def trim_section(text):
+    return text.lstrip(' \t\r\n:*#').rstrip()
+
+
+def extract_document(row):
+    """Return (enriched row, 'kept'), or (None, reason) for a filtered row."""
+    if not isinstance(row, dict) or not isinstance(row.get('markdown'), str) or not row['markdown'].strip():
+        return None, 'invalid_input'
+    text = strip_page_markers(row['markdown'])
     headings = find_headings(text)
-    first_reasoning = next((h['start'] for h in headings if HEADINGS[h['heading']] == 'reasoning'), len(text))
-    # A later "Xét thấy" inside reasoning is not a missing factual section.
-    eligible = [h for h in headings if h['start'] < first_reasoning]
-    start = next((h for role in ('content', 'facts', 'consideration') for h in eligible
-                  if HEADINGS[h['heading']] == role), None)
-    if start is None:
-        return None, {'warnings': ['missing_start_heading']}
-    ends = [h for h in headings if h['start'] > start['end'] and
-            (HEADINGS[h['heading']] in ('reasoning', 'decision') or
-             (HEADINGS[h['heading']] == 'consideration' and HEADINGS[start['heading']] != 'consideration'))]
-    if not ends:
-        return None, {'start_heading': start, 'warnings': ['missing_end_heading']}
-    end = ends[0]
-    left, right = start['end'], end['start']
-    while left < right and text[left] in ' \t\r\n:*#':
-        left += 1
-    while right > left and text[right-1].isspace():
-        right -= 1
-    warnings = []
-    if start['fuzzy'] or end['fuzzy']:
-        warnings.append('fuzzy_heading_match')
-    if HEADINGS[start['heading']] == 'consideration':
-        warnings.append('xet_thay_may_include_legal_reasoning')
-    if any(HEADINGS[h['heading']] in ('content', 'facts') and left < h['start'] < right for h in headings):
-        warnings.append('multiple_content_headings')
-    if left == right:
-        warnings.append('empty_section')
-    return text[left:right], {'start_heading': start, 'end_heading': end, 'start': left, 'end': right,
-                              'offset_basis': 'markdown_without_page_markers', 'warnings': warnings}
+    first_facts = next((h['start'] for h in headings if h['role'] == 'facts'), None)
+    # A decision title before the factual section is a document title, not its conclusion.
+    headings = [h for h in headings if not (
+        h['role'] == 'decision' and first_facts is not None and h['start'] < first_facts)]
+    counts = Counter(h['role'] for h in headings)
+    if any(counts[role] == 0 for role in ('facts', 'application', 'decision')):
+        return None, 'missing_headings'
+    if any(counts[role] != 1 for role in ('facts', 'application', 'decision')):
+        return None, 'duplicate_headings'
+    if [h['role'] for h in headings] != ['facts', 'application', 'decision']:
+        return None, 'invalid_order'
+    facts_heading, application_heading, decision_heading = headings
+    facts = trim_section(text[facts_heading['end']:application_heading['start']])
+    application = trim_section(text[application_heading['end']:decision_heading['start']])
+    conclusion = text[decision_heading['end']:]
+    shadow, positions = shadow_with_positions(conclusion)
+    footer = FOOTER.search(shadow)
+    if footer:
+        conclusion = conclusion[:positions[footer.start()]]
+    conclusion = trim_section(conclusion)
+    if not all((facts, application, conclusion)):
+        return None, 'empty_section'
+    seed = {
+        'facts': facts,
+        'facts_clean': clean_facts(facts, row.get('category')),
+        'application': application,
+        'conclusion': conclusion,
+        'judgment_date': extract_judgment_date(text[:facts_heading['start']]),
+    }
+    return filter_extracted({**row, 'benchmark_seed': seed})
 
 
-def repair_ocr(text, vocabulary):
-    """Only unique, one-edit lowercase matches; every replacement is recorded for review."""
-    protected = {'không', 'có', 'chưa', 'đã', 'phải', 'được', 'miễn',
-                 'gram', 'gam', 'kilogram', 'kilogam', 'kg', 'mg', 'ml', 'cm', 'mm', 'km', 'usd', 'vnd', 'eur'}
-    candidates_by_shape = {}
-    for word in vocabulary:
-        if word and word not in protected:
-            candidates_by_shape.setdefault((word[0], len(word)), []).append(word)
-
-    @lru_cache(maxsize=20000)
-    def nearest(word):
-        if (word in vocabulary or word in protected or len(word) < 4
-                or VIETNAMESE_SYLLABLE.fullmatch(fold(word))):
-            return word
-        candidates = [v for size in (len(word)-1, len(word), len(word)+1)
-                      for v in candidates_by_shape.get((word[0], size), ())]
-        matches = difflib.get_close_matches(word, candidates, n=2, cutoff=0.75)
-        if not matches:
-            return word
-        best = matches[0]
-        ratio = lambda v: difflib.SequenceMatcher(None, word, v).ratio()
-        changes = [op for op in difflib.SequenceMatcher(None, word, best).get_opcodes() if op[0] != 'equal']
-        edits = sum(max(b-a, d-c) for tag, a, b, c, d in changes)
-        tag, a, b, c, d = changes[0]
-        visual_confusion = (word[a:b], best[c:d]) in {('ƣ', 'ư'), ('µ', 'à'), ('¹', 'ạ'), ('l', 'i'), ('i', 'l')}
-        repeated_letter = tag == 'delete' and b-a == 1 and (
-            (a > 0 and word[a-1] == word[a]) or (b < len(word) and word[b] == word[a]))
-        # Tone-only substitutions can change valid words; leave them unchanged.
-        if (edits != 1 or not (visual_confusion or repeated_letter) or fold(word) == fold(best)
-                or (len(matches) > 1 and ratio(best)-ratio(matches[1]) < 0.12)):
-            return word
-        return best
-
-    tokens = list(WORD.finditer(text))
-    pieces, corrections, cursor, i = [], [], 0, 0
-    while i < len(tokens):
-        token = tokens[i]
-        start, end, replacement, consumed = token.start(), token.end(), token.group(), 1
-        neighbors = text[start-1:start] if start else ''
-        neighbors += text[end:end+1]
-        if replacement.islower() and not any(c in '/_-@' or unicodedata.combining(c) for c in neighbors):
-            # Join obvious broken syllables such as "th ẩm" when present in the vocabulary.
-            for size in (3, 2):
-                chunk = tokens[i:i+size]
-                if len(chunk) != size or not all(t.group().islower() for t in chunk):
-                    continue
-                gaps = [text[a.end():b.start()] for a, b in zip(chunk, chunk[1:])]
-                joined = ''.join(t.group() for t in chunk)
-                if (all(g.isspace() and len(g) <= 4 for g in gaps) and joined in vocabulary
-                        and joined not in protected and any(len(t.group()) <= 2 and t.group() not in vocabulary for t in chunk)):
-                    end, replacement, consumed = chunk[-1].end(), joined, size
-                    break
-            # Do not guess a unit or another token immediately following a quantity.
-            if consumed == 1 and not re.search(r'\d[ \t]*$', text[max(0, start-20):start]):
-                replacement = nearest(replacement)
-        if replacement != text[start:end]:
-            corrections.append({'start': start, 'end': end, 'before': text[start:end], 'after': replacement})
-        pieces.extend((text[cursor:start], replacement))
-        cursor, i = end, i+consumed
-    return ''.join(pieces)+text[cursor:], corrections
-
-
-def extract_document(row, vocabulary=None):
-    text = row.get('markdown')
-    if not isinstance(text, str) or not text.strip():
-        raise ValueError('markdown is missing or empty')
-    cleaned = strip_page_markers(text)
-    raw, metadata = extract_section(cleaned)
-    situation, corrections = raw, []
-    if raw and vocabulary:
-        situation, corrections = repair_ocr(raw, vocabulary)
-        if corrections:
-            metadata['warnings'].append('ocr_replacements_require_review')
-    if raw and re.search(r'vien\s+kiem\s+sat[\s\S]{0,350}?de\s+nghi', fold(raw)):
-        metadata['warnings'].append('may_include_prosecutor_recommendations')
-    if raw and re.search('[ƣƢ©®µ¶¸¹º»¼½¾¿×ØÞß]', raw):
-        metadata['warnings'].append('ocr_or_legacy_font_artifacts')
-    metadata.update(method='heading_rules', ocr_corrections=corrections)
-    status = 'missing_section' if not raw else ('needs_review' if metadata['warnings'] else 'extracted')
-    return {**row, 'markdown': cleaned, 'markdown_chars': len(cleaned), 'situation_raw': raw, 'situation': situation,
-            'situation_status': status, 'situation_extraction': metadata,
-            'situation_judge': None, 'situation_attempts': 0, 'situation_error': None}
+def process_line(item):
+    """Top-level worker function so multiprocessing also works on Windows."""
+    number, line, filter_only = item
+    try:
+        row = json.loads(line)
+    except ValueError as exc:
+        return 'invalid_input', number, str(exc)
+    result, status = filter_extracted(row) if filter_only else extract_document(row)
+    if status == 'invalid_input':
+        field = 'a benchmark_seed.facts_clean string' if filter_only else 'nonempty markdown'
+        return status, number, f'Expected an object with {field}'
+    return status, number, json.dumps(result, ensure_ascii=False) if result is not None else None
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--input', default='output/situation_with_judgments.jsonl')
-    parser.add_argument('--output', default='output/situation_rules.jsonl', help='New JSONL file; overwritten on each run')
-    parser.add_argument('--fix-ocr', action='store_true', help='Apply conservative dictionary repairs; edited extracts require review')
-    parser.add_argument('--vocab', type=Path, default=Path(__file__).with_name('Viet74K.txt'), help='OCR vocabulary (default: server/Viet74K.txt)')
-    parser.add_argument('--limit', type=int)
+    parser.add_argument('--input', type=Path, default=Path('output/situation_with_judgments.jsonl'))
+    parser.add_argument('--output', type=Path, default=Path('output/benchmark_seeds.jsonl'))
+    parser.add_argument('--workers', type=int, default=min(8, os.cpu_count() or 1))
+    parser.add_argument('--chunksize', type=int, default=16, help='Rows sent to a worker per batch')
+    parser.add_argument('--limit', type=int, help='Maximum number of nonblank input lines to process')
+    parser.add_argument('--no-progress', action='store_true', help='Hide the tqdm progress bar')
+    parser.add_argument('--filter-only', action='store_true',
+                        help='Filter existing benchmark_seed.facts_clean without re-extracting sections')
     args = parser.parse_args()
-    source, destination = Path(args.input).resolve(), Path(args.output).resolve()
-    if source == destination:
+    if args.workers < 1 or args.chunksize < 1 or (args.limit is not None and args.limit < 1):
+        parser.error('workers, chunksize and limit must be positive')
+    if args.input.resolve() == args.output.resolve():
         parser.error('Input and output must be different files')
-    if args.limit is not None and args.limit < 1:
-        parser.error('limit must be positive')
-    vocabulary = None
-    if args.fix_ocr:
-        vocabulary = load_vocabulary(args.vocab)
+    args.output.parent.mkdir(parents=True, exist_ok=True)
     counts = Counter()
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    with source.open(encoding='utf-8-sig') as stream, destination.open('w', encoding='utf-8') as output:
-        selected = 0
-        for number, line in enumerate(stream, 1):
-            if not line.strip():
-                continue
-            if args.limit is not None and selected >= args.limit:
-                break
-            selected += 1
-            try:
-                row = json.loads(line)
-                if not isinstance(row, dict):
-                    raise ValueError('Expected a JSON object')
-                result = extract_document(row, vocabulary)
-                if vocabulary is not None:
-                    result['situation_extraction'].update(ocr_vocabulary=args.vocab.name,
-                                                          ocr_vocabulary_size=len(vocabulary))
-            except ValueError as exc:
-                counts['invalid_input'] += 1
-                print(f'Line {number}: {exc}', file=sys.stderr)
-                continue
-            counts[result['situation_status']] += 1
-            output.write(json.dumps(result, ensure_ascii=False)+'\n')
+    try:
+        with args.input.open(encoding='utf-8-sig') as source:
+            total = sum(1 for line in source if line.strip())
+            if args.limit is not None:
+                total = min(total, args.limit)
+            source.seek(0)
+            with mp.Pool(args.workers) as pool, args.output.open('w', encoding='utf-8') as output, \
+                    tqdm(total=total, desc='Judgments', unit='doc', disable=args.no_progress) as progress:
+                lines = ((number, line, args.filter_only) for number, line in enumerate(source, 1) if line.strip())
+                selected = islice(lines, args.limit) if args.limit is not None else lines
+                for status, number, payload in pool.imap(process_line, selected, chunksize=args.chunksize):
+                    counts[status] += 1
+                    if status == 'kept':
+                        output.write(payload + '\n')
+                    elif status == 'invalid_input':
+                        tqdm.write(f'Line {number}: {payload}', file=sys.stderr)
+                    progress.set_postfix(kept=counts['kept'],
+                                         filtered=sum(counts.values()) - counts['kept'] - counts['invalid_input'],
+                                         errors=counts['invalid_input'], refresh=False)
+                    progress.update(1)
+    except OSError as exc:
+        parser.error(str(exc))
     print(json.dumps(dict(counts), ensure_ascii=False, indent=2))
     return int(bool(counts['invalid_input']))
 
 
 if __name__ == '__main__':
+    mp.freeze_support()
     raise SystemExit(main())
