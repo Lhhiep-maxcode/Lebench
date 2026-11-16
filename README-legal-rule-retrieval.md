@@ -1,5 +1,7 @@
 # Legal Rule Retrieval Harness
 
+For the new **single-file** `neo4j_parts_final.jsonl` corpus and nested `laws[*].provisions` benchmark, use [README-legal-rule-retrieval-final.md](README-legal-rule-retrieval-final.md). The workflow below documents the older two-file corpus.
+
 End-to-end workflow for the supplied Neo4j JSONL exports:
 
 ```text

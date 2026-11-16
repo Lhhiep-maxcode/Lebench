@@ -9,6 +9,7 @@ from .corpus import prepare, rows
 from .files import private_text_output
 from .harness import DemoClient, OpenAICompatibleClient, aggregate, run_task
 from .vectors import VectorRuleDatabase, build_vectors, make_embedder
+from .final_data import prepare_final
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -22,6 +23,16 @@ def main(argv=None):
     prep.add_argument('--documents', type=Path, required=True)
     prep.add_argument('--parts', type=Path, required=True)
     prep.add_argument('--output-dir', type=Path, default=ROOT / 'output' / 'legal_rule_corpus')
+
+    final = commands.add_parser('prepare-final', help='Embed titles in the final single-file legal corpus')
+    final.add_argument('--parts', type=Path, required=True)
+    final.add_argument('--output-dir', type=Path, required=True)
+    final.add_argument('--embedding-backend', choices=('api', 'local', 'hash'), default='api')
+    final.add_argument('--embedding-model', help='Embedding model name or local model directory')
+    final.add_argument('--embedding-base-url', help='OpenAI-compatible local embedding endpoint')
+    final.add_argument('--embedding-api-key-env', default='EMBEDDING_API_KEY')
+    final.add_argument('--batch-size', type=int, default=32)
+    final.add_argument('--timeout', type=float, default=120)
 
     embed = commands.add_parser('embed', help='Embed prepared provision chunks and build FAISS index')
     embed.add_argument('--rules-dir', type=Path, default=ROOT / 'output' / 'legal_rule_corpus')
@@ -55,8 +66,11 @@ def main(argv=None):
     dsh = commands.add_parser('run-dsh', help='Run benchmark through DeepSeek Harness SDK + legal MCP tools')
     dsh.add_argument('--rules-dir', type=Path, default=ROOT / 'output' / 'legal_rule_corpus')
     dsh.add_argument('--index-dir', type=Path, default=ROOT / 'output' / 'legal_rule_index')
+    dsh.add_argument('--final-dir', type=Path, help='Single-file final corpus prepared by prepare-final')
     dsh.add_argument('--tasks', type=Path, required=True)
     dsh.add_argument('--output', type=Path, default=ROOT / 'output' / 'rule_retrieval_dsh.jsonl')
+    dsh.add_argument('--conversation-output', type=Path,
+                     help='Optional OpenAI chat-template JSONL with messages, tools, and reasoning_content')
     dsh.add_argument('--workspace-root', type=Path, default=ROOT / 'output' / 'rule_workspaces')
     dsh.add_argument('--dsh-home', type=Path, default=ROOT / 'output' / 'legal_dsh_home')
     dsh.add_argument('--dsh-bin', type=Path, help='Optional dsh executable built from your clone')
@@ -85,6 +99,22 @@ def main(argv=None):
         print('Prepared:', args.output_dir / 'rules.jsonl')
         return 0
 
+    if args.command == 'prepare-final':
+        if not args.parts.is_file():
+            parser.error('Final legal parts JSONL does not exist')
+        try:
+            embedder = make_embedder(args.embedding_backend, args.embedding_model,
+                                     args.embedding_base_url,
+                                     os.getenv(args.embedding_api_key_env, 'dummy'), args.timeout)
+            manifest = prepare_final(args.parts, args.output_dir, embedder,
+                                     args.embedding_backend, args.embedding_model,
+                                     args.batch_size)
+        except (ValueError, ImportError, RuntimeError) as exc:
+            parser.error(str(exc))
+        print('Prepared final corpus:', args.output_dir / 'rules.jsonl')
+        print('Manifest:', json.dumps(manifest, ensure_ascii=False))
+        return 0
+
     if args.command == 'embed':
         if not (args.rules_dir / 'rules.jsonl').is_file():
             parser.error('Prepared rules missing; run prepare first')
@@ -105,6 +135,8 @@ def main(argv=None):
 
     if args.command == 'run-dsh':
         from .dsh_runner import run_benchmark
+        if args.final_dir:
+            args.rules_dir = args.index_dir = args.final_dir
         if not args.tasks.is_file() or not (args.rules_dir / 'rules.jsonl').is_file():
             parser.error('Tasks or prepared rules missing; run prepare first')
         if not (args.index_dir / 'manifest.json').is_file():
@@ -116,7 +148,10 @@ def main(argv=None):
                      (args.index_dir / 'manifest.json').resolve()}
         if args.output.resolve() in protected:
             parser.error('Result output must differ from tasks, rules, and index')
+        if args.conversation_output and args.conversation_output.resolve() in protected:
+            parser.error('Conversation output must differ from tasks, rules, and index')
         summary = run_benchmark(args.tasks, args.output,
+                      conversation_output=args.conversation_output,
                       rules_dir=args.rules_dir, index_dir=args.index_dir,
                       workspace_root=args.workspace_root, dsh_home=args.dsh_home,
                       base_url=args.base_url, model=args.model,

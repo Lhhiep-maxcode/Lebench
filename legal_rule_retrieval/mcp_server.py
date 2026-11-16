@@ -8,17 +8,18 @@ from mcp.server.fastmcp import FastMCP
 
 from .harness import ToolSession
 from .vectors import VectorRuleDatabase, make_embedder
+from .final_data import FinalRuleDatabase, score_submission
 
 
-def create_server(database, workspace_root, task_id, submission_path):
+def create_server(database, workspace_root, task_id, submission_path, laws=None):
     tools = ToolSession(database, workspace_root, task_id)
     submission_path = Path(submission_path)
     server = FastMCP(
         'legal_rules',
         instructions=('Find Vietnamese legal provisions for the supplied facts and issues. '
                       'Search, inspect full rules, check validity when relevant, then call '
-                      'submit_rules once. Use only exact rule IDs returned by the tools. '
-                      'Stop after a successful submission.'),
+                      + ('submit' if laws is not None else 'submit_rules') + ' once. Use exact '
+                      'identifiers returned by the tools. Stop after a successful submission.'),
     )
 
     @server.tool()
@@ -36,16 +37,28 @@ def create_server(database, workspace_root, task_id, submission_path):
         """Check document-level effective dates over an ISO date interval; unknown is possible."""
         return tools.dispatch('check_validity', {'rule_id': rule_id, 'start': start, 'end': end})
 
-    @server.tool()
-    def submit_rules(rule_ids: list[str]) -> dict:
-        """Submit exact IDs returned by search/get. This is the final benchmark action."""
-        if tools.submitted is not None:
-            raise ValueError('Rules have already been submitted')
-        result = tools.dispatch('submit_rules', {'rule_ids': rule_ids})
+    def save_submission(result):
         temporary = submission_path.with_suffix(submission_path.suffix + '.tmp')
         temporary.write_text(json.dumps(result, ensure_ascii=False), encoding='utf-8')
         temporary.replace(submission_path)
         return result
+
+    if laws is None:
+        @server.tool()
+        def submit_rules(rule_ids: list[str]) -> dict:
+            """Submit exact IDs returned by search/get. This is the final benchmark action."""
+            if tools.submitted is not None:
+                raise ValueError('Rules have already been submitted')
+            return save_submission(tools.dispatch('submit_rules', {'rule_ids': rule_ids}))
+    else:
+        @server.tool()
+        def submit(identifiers: list[str]) -> dict:
+            """Submit legal-part identifiers. Returns article-level precision and recall; then finish."""
+            if tools.submitted is not None:
+                raise ValueError('Rules have already been submitted')
+            result = score_submission(identifiers, laws, database)
+            tools.submitted = result['submitted_rule_ids']
+            return save_submission(result)
 
     @server.tool()
     def create_file(content: str, path: str) -> dict:
@@ -89,15 +102,24 @@ def main(argv=None):
     cli.add_argument('--submission-path', type=Path, required=True)
     cli.add_argument('--embedding-base-url')
     cli.add_argument('--embedding-api-key-env', default='EMBEDDING_API_KEY')
+    cli.add_argument('--gold-path', type=Path, help='Private per-task gold citations; enables final-corpus mode')
     args = cli.parse_args(argv)
     manifest = json.loads((args.index_dir / 'manifest.json').read_text(encoding='utf-8'))
     import os
     embedder = make_embedder(manifest['backend'], manifest['embedding_model'],
                              args.embedding_base_url,
                              os.getenv(args.embedding_api_key_env) or 'dummy')
-    with VectorRuleDatabase(args.rules_dir, args.index_dir, embedder) as database:
+    if manifest.get('version') == 2:
+        if args.gold_path is None:
+            cli.error('--gold-path is required for the final corpus')
+        laws = json.loads(args.gold_path.read_text(encoding='utf-8'))
+        database_context = FinalRuleDatabase(args.rules_dir, embedder)
+    else:
+        laws = None
+        database_context = VectorRuleDatabase(args.rules_dir, args.index_dir, embedder)
+    with database_context as database:
         create_server(database, args.workspace_root, args.task_id,
-                      args.submission_path).run(transport='stdio')
+                      args.submission_path, laws=laws).run(transport='stdio')
 
 
 if __name__ == '__main__':
