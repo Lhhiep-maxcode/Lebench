@@ -93,11 +93,21 @@ class DeepSeekIntegrationTests(unittest.TestCase):
         patch = self.root / 'legal.patch.yml'
         write_patch(patch, rules_dir=self.rules, index_dir=self.index,
                     workspace_root=self.workspace, task_id='case-1',
-                    submission_path=self.submission)
+                    submission_path=self.submission,
+                    base_url='http://127.0.0.1:8000/v1', model='local-chat')
         text = patch.read_text(encoding='utf-8')
         self.assertIn("name: '@deepseek-ai/dsh-mcp-client'", text)
+        self.assertIn("name: '@deepseek-ai/dsh-llm-pi-ai'", text)
+        self.assertIn('api: openai-completions', text)
         self.assertIn('serverName: legal_rules', text)
+        self.assertIn('- id: llm-deepseek\n  disabled: true', text)
         self.assertIn('- id: persistent-pwsh\n  disabled: true', text)
+        write_patch(patch, rules_dir=self.rules, index_dir=self.index,
+                    workspace_root=self.workspace, task_id='case-1',
+                    submission_path=self.submission,
+                    base_url='http://127.0.0.1:8000/v1', model='local-chat',
+                    memory_sessions=True)
+        self.assertIn('- id: sessions\n  disabled: true', patch.read_text(encoding='utf-8'))
         events = [
             {'type': 'tool/call', 'data': {'step': 1, 'callId': 'c1',
              'name': 'mcp__legal_rules__search_legal_rules',
@@ -109,6 +119,38 @@ class DeepSeekIntegrationTests(unittest.TestCase):
         self.assertEqual(trace[0]['action'], 'search_legal_rules')
         self.assertEqual(trace[0]['arguments']['top_k'], 1)
         self.assertNotIn('error', trace[0]['observation'])
+
+    def test_deepseek_profile_advertises_only_legal_tools(self):
+        try:
+            from deepseek_harness import DeepSeekHarness
+        except ImportError:
+            self.skipTest('Install requirements-legal-rule-retrieval-dsh.txt for runtime smoke test')
+        self.workspace.mkdir(parents=True, exist_ok=True)
+        patch = self.root / 'runtime.patch.yml'
+        write_patch(patch, rules_dir=self.rules, index_dir=self.index,
+                    workspace_root=self.workspace, task_id='smoke',
+                    submission_path=self.submission,
+                    base_url='http://127.0.0.1:9/v1', model='offline-smoke',
+                    memory_sessions=True)
+        # The endpoint intentionally refuses connections. We only verify that
+        # the actual runtime assembles the intended model route and tool schema.
+        with patch.open('a', encoding='utf-8') as stream:
+            stream.write('- id: llm-retry\n  disabled: true\n')
+        with DeepSeekHarness(dsh_home=str(self.root / 'dsh-home'),
+                             cwd=str(self.workspace), profile='sdk-minimal',
+                             patches=(str(patch),), provider='legal-vllm',
+                             model='offline-smoke', max_tokens=128,
+                             env={'DSH_SYSTEM_PROMPT': 'Test', 'VLLM_API_KEY': 'dummy'}) as harness:
+            result = harness.run('Find the rules.', session_id='offline-smoke')
+        headers = [item['data']['header'] for item in result.events
+                   if item.get('type') == 'request/header']
+        self.assertEqual(len(headers), 1)
+        self.assertEqual(headers[0]['config']['provider'], 'legal-vllm')
+        self.assertEqual({item['name'] for item in headers[0]['tools']},
+                         {'mcp__legal_rules__' + name for name in (
+                             'search_legal_rules', 'get_legal_rule', 'check_validity',
+                             'submit_rules', 'create_file', 'read_file',
+                             'add', 'subtract', 'multiply', 'divide')})
 
 
 if __name__ == '__main__':

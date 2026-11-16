@@ -39,6 +39,8 @@ def create_server(database, workspace_root, task_id, submission_path):
     @server.tool()
     def submit_rules(rule_ids: list[str]) -> dict:
         """Submit exact IDs returned by search/get. This is the final benchmark action."""
+        if tools.submitted is not None:
+            raise ValueError('Rules have already been submitted')
         result = tools.dispatch('submit_rules', {'rule_ids': rule_ids})
         temporary = submission_path.with_suffix(submission_path.suffix + '.tmp')
         temporary.write_text(json.dumps(result, ensure_ascii=False), encoding='utf-8')
@@ -56,22 +58,22 @@ def create_server(database, workspace_root, task_id, submission_path):
         return tools.dispatch('read_file', {'path': path})
 
     @server.tool()
-    def add(a: str, b: str) -> dict:
+    def add(a: str | int | float, b: str | int | float) -> dict:
         """Add two decimal numbers; return a decimal string."""
         return tools.dispatch('add', {'a': a, 'b': b})
 
     @server.tool()
-    def subtract(a: str, b: str) -> dict:
+    def subtract(a: str | int | float, b: str | int | float) -> dict:
         """Subtract b from a using decimal arithmetic."""
         return tools.dispatch('subtract', {'a': a, 'b': b})
 
     @server.tool()
-    def multiply(a: str, b: str) -> dict:
+    def multiply(a: str | int | float, b: str | int | float) -> dict:
         """Multiply two decimal numbers."""
         return tools.dispatch('multiply', {'a': a, 'b': b})
 
     @server.tool()
-    def divide(a: str, b: str) -> dict:
+    def divide(a: str | int | float, b: str | int | float) -> dict:
         """Divide a by b using decimal arithmetic."""
         return tools.dispatch('divide', {'a': a, 'b': b})
 
@@ -92,7 +94,7 @@ def main(argv=None):
     import os
     embedder = make_embedder(manifest['backend'], manifest['embedding_model'],
                              args.embedding_base_url,
-                             os.getenv(args.embedding_api_key_env, 'dummy'))
+                             os.getenv(args.embedding_api_key_env) or 'dummy')
     with VectorRuleDatabase(args.rules_dir, args.index_dir, embedder) as database:
         create_server(database, args.workspace_root, args.task_id,
                       args.submission_path).run(transport='stdio')

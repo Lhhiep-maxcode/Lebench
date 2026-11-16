@@ -1,14 +1,20 @@
 import io
 import json
+import os
+import sys
 import tempfile
+import threading
+import types
 import unittest
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from unittest.mock import patch
 
 from legal_rule_retrieval.__main__ import main
 from legal_rule_retrieval.corpus import prepare
+from legal_rule_retrieval.files import private_text_output
 from legal_rule_retrieval.harness import OpenAICompatibleClient, ToolSession, aggregate, parse_action, run_task
-from legal_rule_retrieval.vectors import APIEmbedder, HashEmbedder, VectorRuleDatabase, build_vectors
+from legal_rule_retrieval.vectors import APIEmbedder, HashEmbedder, LocalEmbedder, VectorRuleDatabase, build_vectors
 
 
 DOC_ID = '10/2020/ND, 2020-01-01, Nghị định, Chính phủ'
@@ -74,6 +80,8 @@ class RuleHarnessTests(unittest.TestCase):
         self.assertIsNone(self.database.get('Điều 1, missing-document')['document_id'])
         self.assertEqual(self.database.get(CLAUSE_ID)['content'], '2. Phải có vốn kinh doanh và trụ sở.')
         self.assertIn(CLAUSE_ID, [hit['rule_id'] for hit in self.database.search('vốn kinh doanh', 4)])
+        with self.assertRaisesRegex(ValueError, '4096'):
+            self.database.search('x' * 4097)
         self.assertIsNone(self.database.get('Khoản 2'))
 
     def test_integrity_rejects_modified_prepared_data(self):
@@ -110,6 +118,15 @@ class RuleHarnessTests(unittest.TestCase):
         self.assertEqual(session.dispatch('read_file', {'path': 'notes/facts.txt'})['content'], 'văn bản')
         with self.assertRaises(ValueError):
             session.dispatch('read_file', {'path': '../outside.txt'})
+        outside = Path(self.tmp.name) / 'outside.txt'
+        outside.write_text('private', encoding='utf-8')
+        try:
+            (session.workspace / 'link.txt').symlink_to(outside)
+        except (OSError, NotImplementedError):
+            pass  # Windows may disallow symlink creation for this account.
+        else:
+            with self.assertRaises(ValueError):
+                session.dispatch('read_file', {'path': 'link.txt'})
         with self.assertRaises(ValueError):
             session.dispatch('create_file', {'path': 'notes/facts.txt', 'content': 'overwrite'})
         for action, expected in [('add', '0.3'), ('subtract', '-0.1'),
@@ -117,6 +134,64 @@ class RuleHarnessTests(unittest.TestCase):
             self.assertEqual(session.dispatch(action, {'a': '0.1', 'b': '0.2'})['result'], expected)
         with self.assertRaisesRegex(ValueError, 'Division by zero'):
             session.dispatch('divide', {'a': 1, 'b': 0})
+        for number in range(9):
+            session.dispatch('create_file', {'path': f'note-{number}.txt', 'content': 'a'})
+        with self.assertRaisesRegex(ValueError, 'quota'):
+            session.dispatch('create_file', {'path': 'too-many.txt', 'content': 'a'})
+
+    def test_offline_model_and_http_url_guards(self):
+        with self.assertRaisesRegex(ValueError, 'existing directory'):
+            LocalEmbedder('this-model-would-require-a-download')
+        model_dir = Path(self.tmp.name) / 'local-model'
+        model_dir.mkdir()
+        calls = []
+        fake_module = types.ModuleType('sentence_transformers')
+        class FakeSentenceTransformer:
+            def __init__(self, path, local_files_only=False):
+                calls.append((path, local_files_only))
+        fake_module.SentenceTransformer = FakeSentenceTransformer
+        with patch.dict(sys.modules, {'sentence_transformers': fake_module}):
+            LocalEmbedder(model_dir)
+        self.assertEqual(calls, [(str(model_dir.resolve()), True)])
+        with self.assertRaisesRegex(ValueError, 'HTTP'):
+            APIEmbedder('file:///tmp/rules', 'embed-model')
+        with self.assertRaisesRegex(ValueError, 'without credentials'):
+            OpenAICompatibleClient('http://user:secret@localhost:8000/v1', 'chat-model')
+
+    def test_embedding_client_does_not_follow_redirects(self):
+        class Redirect(BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.send_response(302)
+                self.send_header('Location', 'https://example.invalid/collect')
+                self.end_headers()
+
+            def log_message(self, *_):
+                pass
+
+        with HTTPServer(('127.0.0.1', 0), Redirect) as server:
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                client = APIEmbedder(f'http://127.0.0.1:{server.server_port}/v1', 'embed-model')
+                with patch.dict(os.environ, {'HTTP_PROXY': 'http://127.0.0.1:1',
+                                            'http_proxy': 'http://127.0.0.1:1',
+                                            'NO_PROXY': '', 'no_proxy': ''}):
+                    with self.assertRaisesRegex(RuntimeError, 'Embedding HTTP 302'):
+                        client.embed(['sample'])
+            finally:
+                server.shutdown()
+                thread.join()
+
+    def test_benchmark_output_is_private(self):
+        path = Path(self.tmp.name) / 'trace.jsonl'
+        with private_text_output(path) as stream:
+            stream.write('private case facts\n')
+        if os.name == 'posix':
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            link = Path(self.tmp.name) / 'trace-link.jsonl'
+            link.symlink_to(path)
+            with self.assertRaises(OSError):
+                private_text_output(link)
 
     def test_multi_turn_trace_and_gold_not_in_prompt(self):
         task = {'id': 't1', 'benchmark': {'facts': 'Một người xin phép kinh doanh du lịch.',
@@ -154,7 +229,7 @@ class RuleHarnessTests(unittest.TestCase):
         response = {'data': [{'index': 1, 'embedding': [0, 1]},
                              {'index': 0, 'embedding': [1, 0]}]}
         client = APIEmbedder('http://localhost:8001/v1', 'embed-model', api_key='secret')
-        with patch('urllib.request.urlopen', return_value=io.BytesIO(json.dumps(response).encode())) as send:
+        with patch('legal_rule_retrieval.vectors.urlopen_direct', return_value=io.BytesIO(json.dumps(response).encode())) as send:
             vectors = client.embed(['a', 'b'])
         self.assertEqual(vectors.tolist(), [[1, 0], [0, 1]])
         request = send.call_args.args[0]
@@ -165,7 +240,7 @@ class RuleHarnessTests(unittest.TestCase):
         client = OpenAICompatibleClient('http://localhost:8000/v1', 'local-model',
                                         api_key='secret', extra_body={'max_tokens': 512})
         response = {'choices': [{'message': {'content': '```json\n{"action":"submit_rules","arguments":{"rule_ids":[]}}\n```'}}]}
-        with patch('urllib.request.urlopen', return_value=io.BytesIO(json.dumps(response).encode())) as send:
+        with patch('legal_rule_retrieval.harness.urlopen_direct', return_value=io.BytesIO(json.dumps(response).encode())) as send:
             raw = client.complete([{'role': 'user', 'content': 'Find a rule'}])
         request = send.call_args.args[0]
         self.assertEqual(request.full_url, 'http://localhost:8000/v1/chat/completions')
@@ -188,7 +263,7 @@ class RuleHarnessTests(unittest.TestCase):
         ]
         responses = [io.BytesIO(json.dumps({'choices': [{'message': {'content': json.dumps(action, ensure_ascii=False)}}]}).encode())
                      for action in actions]
-        with patch('urllib.request.urlopen', side_effect=responses):
+        with patch('legal_rule_retrieval.harness.urlopen_direct', side_effect=responses):
             code = main(['run', '--rules-dir', str(self.rules_dir), '--index-dir', str(self.index_dir),
                          '--tasks', str(task_path), '--output', str(output_path),
                          '--workspace-root', str(self.workspace), '--base-url', 'http://localhost:8000/v1',

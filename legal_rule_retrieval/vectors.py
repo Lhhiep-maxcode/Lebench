@@ -1,7 +1,9 @@
 """Embedding providers and an exact cosine-similarity FAISS index."""
 
 import hashlib
+import inspect
 import json
+import os
 import re
 import sys
 import unicodedata
@@ -14,6 +16,7 @@ import numpy as np
 from tqdm import tqdm
 
 from .corpus import RuleStore, rows
+from .network import api_base_url, urlopen_direct
 
 
 class APIEmbedder:
@@ -22,7 +25,7 @@ class APIEmbedder:
     def __init__(self, base_url, model, api_key='dummy', timeout=120):
         if not base_url:
             raise ValueError('Embedding API requires --embedding-base-url')
-        self.url = base_url.rstrip('/') + '/embeddings'
+        self.url = api_base_url(base_url) + '/embeddings'
         self.model = model
         self.api_key = api_key
         self.timeout = timeout
@@ -33,10 +36,10 @@ class APIEmbedder:
             self.url, data=json.dumps(payload, ensure_ascii=False).encode('utf-8'),
             headers={'Content-Type': 'application/json', 'Authorization': 'Bearer ' + self.api_key})
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            with urlopen_direct(request, timeout=self.timeout) as response:
                 result = json.load(response)
         except urllib.error.HTTPError as exc:
-            raise RuntimeError(f'Embedding HTTP {exc.code}: {exc.read(500).decode("utf-8", errors="replace")}') from exc
+            raise RuntimeError(f'Embedding HTTP {exc.code}') from exc
         ordered = sorted(result['data'], key=lambda item: item['index'])
         if len(ordered) != len(texts) or [item['index'] for item in ordered] != list(range(len(texts))):
             raise ValueError('Embedding server returned incomplete or misordered batch')
@@ -47,11 +50,18 @@ class LocalEmbedder:
     """Optional sentence-transformers backend, loaded only when selected."""
 
     def __init__(self, model):
+        model_path = Path(model).expanduser().resolve()
+        if not model_path.is_dir():
+            raise ValueError('Local embedding model must be an existing directory; model IDs may download files')
+        os.environ['HF_HUB_OFFLINE'] = '1'
+        os.environ['TRANSFORMERS_OFFLINE'] = '1'
         try:
             from sentence_transformers import SentenceTransformer
         except ImportError as exc:
             raise ImportError('Install sentence-transformers for --embedding-backend local') from exc
-        self.model = SentenceTransformer(model)
+        if 'local_files_only' not in inspect.signature(SentenceTransformer).parameters:
+            raise RuntimeError('sentence-transformers must support local_files_only for offline embedding')
+        self.model = SentenceTransformer(str(model_path), local_files_only=True)
 
     def embed(self, texts):
         return np.asarray(self.model.encode(texts, convert_to_numpy=True, show_progress_bar=False),
@@ -216,6 +226,8 @@ class VectorRuleDatabase:
     def search(self, query, top_k=5):
         if not isinstance(query, str) or not query.strip():
             raise ValueError('query must be nonempty text')
+        if len(query) > 4096:
+            raise ValueError('query must be at most 4096 characters')
         if type(top_k) is not int or not 1 <= top_k <= 20:
             raise ValueError('top_k must be an integer between 1 and 20')
         vector = np.asarray(self.embedder.embed([self.manifest.get('query_prefix', '') + query]),

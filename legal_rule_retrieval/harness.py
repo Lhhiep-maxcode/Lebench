@@ -8,6 +8,8 @@ import urllib.request
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
+from .network import api_base_url, urlopen_direct
+
 
 TOOL_SPECS = [
     {'name': 'search_legal_rules', 'description': 'Embedding similarity search over prepared provisions; returns IDs, cosine scores, and short previews.',
@@ -64,7 +66,7 @@ class OpenAICompatibleClient:
     """Minimal Chat Completions client for a local vLLM OpenAI-compatible server."""
 
     def __init__(self, base_url, model, api_key='dummy', timeout=120, extra_body=None):
-        self.url = base_url.rstrip('/') + '/chat/completions'
+        self.url = api_base_url(base_url) + '/chat/completions'
         self.model = model
         self.api_key = api_key
         self.timeout = timeout
@@ -79,10 +81,10 @@ class OpenAICompatibleClient:
             self.url, data=json.dumps(payload, ensure_ascii=False).encode('utf-8'),
             headers={'Content-Type': 'application/json', 'Authorization': 'Bearer ' + self.api_key})
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            with urlopen_direct(request, timeout=self.timeout) as response:
                 data = json.load(response)
         except urllib.error.HTTPError as exc:
-            raise RuntimeError(f'LLM HTTP {exc.code}: {exc.read(500).decode("utf-8", errors="replace")}') from exc
+            raise RuntimeError(f'LLM HTTP {exc.code}') from exc
         message = data['choices'][0]['message']
         content = message.get('content')
         if not isinstance(content, str) or not content.strip():
@@ -128,10 +130,12 @@ class ToolSession:
         self.database = database
         self.seen = set()
         self.submitted = None
+        self.files_created = 0
+        self.bytes_written = 0
         label = re.sub(r'[^a-zA-Z0-9_-]+', '_', str(task_id))[:40] or 'task'
         digest = hashlib.sha256(str(task_id).encode()).hexdigest()[:12]
         self.workspace = (Path(workspace_root) / f'{label}_{digest}').resolve()
-        self.workspace.mkdir(parents=True, exist_ok=True)
+        self.workspace.mkdir(mode=0o700, parents=True, exist_ok=True)
 
     def file_path(self, path):
         if not isinstance(path, str) or not path.strip():
@@ -174,8 +178,9 @@ class ToolSession:
             return self.database.check_validity(arguments.get('rule_id'), arguments.get('start'), arguments.get('end'))
         if action == 'submit_rules':
             ids = arguments.get('rule_ids')
-            if not isinstance(ids, list) or any(not isinstance(x, str) for x in ids):
-                raise ValueError('rule_ids must be a list of strings')
+            if (not isinstance(ids, list) or len(ids) > 100 or
+                    any(not isinstance(x, str) for x in ids)):
+                raise ValueError('rule_ids must be at most 100 strings')
             ids = list(dict.fromkeys(ids))
             missing = [rule_id for rule_id in ids if rule_id not in self.seen]
             if missing:
@@ -184,14 +189,21 @@ class ToolSession:
             return {'submitted_rule_ids': ids}
         if action == 'create_file':
             path, content = self.file_path(arguments.get('path')), arguments.get('content')
-            if not isinstance(content, str) or len(content.encode('utf-8')) > 1_000_000:
+            if not isinstance(content, str):
+                raise ValueError('content must be UTF-8 text')
+            byte_count = len(content.encode('utf-8'))
+            if byte_count > 1_000_000:
                 raise ValueError('content must be UTF-8 text of at most 1 MB')
+            if self.files_created >= 10 or self.bytes_written + byte_count > 2_000_000:
+                raise ValueError('Task file quota exceeded (10 files or 2 MB)')
             path.parent.mkdir(parents=True, exist_ok=True)
             try:
                 with path.open('x', encoding='utf-8') as output:
                     output.write(content)
             except FileExistsError as exc:
                 raise ValueError('File already exists') from exc
+            self.files_created += 1
+            self.bytes_written += byte_count
             return {'path': str(path.relative_to(self.workspace)), 'characters_written': len(content)}
         if action == 'read_file':
             path = self.file_path(arguments.get('path'))

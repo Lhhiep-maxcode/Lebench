@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 
 from .corpus import prepare, rows
+from .files import private_text_output
 from .harness import DemoClient, OpenAICompatibleClient, aggregate, run_task
 from .vectors import VectorRuleDatabase, build_vectors, make_embedder
 
@@ -65,7 +66,10 @@ def main(argv=None):
     dsh.add_argument('--embedding-base-url')
     dsh.add_argument('--embedding-api-key-env', default='EMBEDDING_API_KEY')
     dsh.add_argument('--max-steps', type=int, default=12)
-    dsh.add_argument('--max-tokens', type=int, default=None)
+    dsh.add_argument('--max-tokens', type=int, default=4096)
+    dsh.add_argument('--context-window', type=int, default=131072)
+    dsh.add_argument('--memory-sessions', action='store_true',
+                     help='Do not persist DeepSeek sessions; useful if native session storage is unavailable')
 
     demo = commands.add_parser('demo', help='Offline end-to-end demo with hash vectors (not real embeddings)')
     demo.add_argument('--documents', type=Path, default=ROOT / 'src_data' / 'neo4j_documents_sample.jsonl')
@@ -105,23 +109,25 @@ def main(argv=None):
             parser.error('Tasks or prepared rules missing; run prepare first')
         if not (args.index_dir / 'manifest.json').is_file():
             parser.error('Vector index missing; run embed first')
-        if args.max_steps < 1 or args.max_tokens is not None and args.max_tokens < 1:
-            parser.error('--max-steps and --max-tokens must be positive')
+        if args.max_steps < 1 or args.max_tokens < 1 or args.context_window < 4096:
+            parser.error('--max-steps and --max-tokens must be positive; --context-window >= 4096')
         protected = {args.tasks.resolve(), (args.rules_dir / 'rules.jsonl').resolve(),
                      (args.index_dir / 'index.faiss').resolve(),
                      (args.index_dir / 'manifest.json').resolve()}
         if args.output.resolve() in protected:
             parser.error('Result output must differ from tasks, rules, and index')
-        run_benchmark(args.tasks, args.output,
+        summary = run_benchmark(args.tasks, args.output,
                       rules_dir=args.rules_dir, index_dir=args.index_dir,
                       workspace_root=args.workspace_root, dsh_home=args.dsh_home,
                       base_url=args.base_url, model=args.model,
                       api_key=os.getenv(args.api_key_env, 'dummy'),
                       max_steps=args.max_steps, max_tokens=args.max_tokens,
+                      context_window=args.context_window,
                       embedding_base_url=args.embedding_base_url,
                       embedding_api_key_env=args.embedding_api_key_env,
-                      dsh_bin=args.dsh_bin)
-        return 0
+                      dsh_bin=args.dsh_bin, memory_sessions=args.memory_sessions)
+        return 1 if any(summary['statuses'].get(status, 0) for status in
+                        ('runtime_error', 'error', 'no_finish_reason')) else 0
 
     if args.command == 'demo':
         if not args.documents.is_file() or not args.parts.is_file() or not args.tasks.is_file():
@@ -165,7 +171,7 @@ def main(argv=None):
         parser.error('Result output must differ from tasks, rules, and index')
     result_path.parent.mkdir(parents=True, exist_ok=True)
     results = []
-    with VectorRuleDatabase(rules_dir, index_dir, embedder) as database, result_path.open('w', encoding='utf-8') as output:
+    with VectorRuleDatabase(rules_dir, index_dir, embedder) as database, private_text_output(result_path) as output:
         for task in rows(args.tasks):
             result = run_task(task, database, client,
                               max_steps=args.max_steps if args.command == 'run' else 8,
