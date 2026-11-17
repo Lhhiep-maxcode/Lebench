@@ -83,7 +83,7 @@ class DirectRunnerTests(unittest.TestCase):
             with FinalRuleDatabase(prepared, HashEmbedder()) as database, \
                     contextlib.redirect_stderr(log):
                 result = run_task(sample, database, ScriptedClient(rule['identifier']),
-                                  workspace_root=root / 'work', debug=True)
+                                  workspace_root=root / 'work', debug=True, verbosity=2)
             self.assertEqual(result['status'], 'submitted')
             self.assertEqual(result['metrics']['precision'], 1.0)
             self.assertEqual(result['metrics']['recall'], 1.0)
@@ -97,6 +97,18 @@ class DirectRunnerTests(unittest.TestCase):
             self.assertNotIn('laws', conversation['messages'][1]['content'])
             self.assertIn('step 1: sending chat request', log.getvalue())
             self.assertIn('tool submit finished', log.getvalue())
+            events = [json.loads(line.removeprefix('TRACE '))
+                      for line in log.getvalue().splitlines() if line.startswith('TRACE ')]
+            self.assertEqual([event['event'] for event in events],
+                             ['task_start', 'llm_request', 'llm_response',
+                              'tool_call', 'tool_result', 'llm_request',
+                              'llm_response', 'tool_call', 'tool_result', 'task_end'])
+            self.assertEqual(events[2]['reasoning_content'], 'checking')
+            self.assertEqual(events[3]['arguments']['top_k'], 5)
+            self.assertIn('results', events[4]['observation'])
+            self.assertEqual(events[8]['observation']['precision'], 1.0)
+            self.assertEqual(events[-1]['status'], 'submitted')
+            self.assertTrue(all(event['timestamp'].endswith('+00:00') for event in events))
 
 
 if __name__ == '__main__':

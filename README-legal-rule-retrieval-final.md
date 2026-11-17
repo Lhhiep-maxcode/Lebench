@@ -46,16 +46,16 @@ Gold rules come from each `laws[*].provisions[*].citation_str`. The scorer colla
 
 `check_validity` accepts ISO `YYYY-MM-DD` strings in `effectiveDate` / `expirationDate` (or their snake_case equivalents). An absent expiration date is allowed. Re-run `prepare-final` after changing source dates. Search uses **only cosine similarity between the query embedding and each stored title embedding**. It does not inspect `content` or add an article-number boost. Provisions from the same document share a title vector and therefore tie in embedding score.
 
-If a chat request fails, the task receives `llm_error`; the message is printed to stderr and stored in the result row's `error` field. `--debug` prints live judgment/step/tool progress, elapsed times, and a Python traceback for chat failures. It omits full facts, queries, provision text, and model reasoning from the terminal; those details are in the saved JSONL. `--request-timeout` controls the wait for each chat or embedding HTTP request (default 600 seconds). The older `--startup-timeout` flag is accepted as an alias; there is no separate runtime startup in this mode.
+If a chat request fails, the task receives `llm_error`; the message is printed to stderr and stored in the result row's `error` field. Set `--verbosity 0` (default) for completed-task results only, `--verbosity 1` for live request/tool progress and elapsed times, or `--verbosity 2` to also print each LLM response (including `reasoning_content`), tool arguments, and tool observations as `TRACE` JSON lines. These lines are flushed immediately. `--debug` adds a traceback for chat failures and implies at least verbosity 1; use `--debug --verbosity 2` for both. Level 2 can print full case facts or legal text returned by tools, so keep the log private. `--request-timeout` controls the wait for each chat or embedding HTTP request (default 600 seconds). The older `--startup-timeout` flag is accepted as an alias; there is no separate runtime startup in this mode.
 
 To watch and save the live log on Linux, add `-u` to Python and pipe both output streams to `tee`:
 
 ```bash
 set -o pipefail
-python3 -u -m legal_rule_retrieval run-python [your existing options] --debug 2>&1 | tee benchmark.log
+python3 -u -m legal_rule_retrieval run-python [your existing options] --verbosity 2 --debug 2>&1 | tee benchmark.log
 ```
 
-Replace `[your existing options]` with the actual arguments from your command. In another terminal, `tail -f benchmark.log` follows the same log. Each chat request is logged when it starts; the next line appears when the server responds or the request times out. Model tokens are not streamed live.
+Replace `[your existing options]` with the actual arguments from your command. In another terminal, `tail -f benchmark.log` follows the same log. Each chat request is logged when it starts; its response and subsequent tool interactions appear as they finish. Chat Completions currently uses `stream=false`, so model tokens are not shown while a request is still running.
 
 `--max-tokens` is the requested output limit per model call; it must be smaller than `--context-window` and supported by your chat server. A large value such as `65536` may be rejected by a server with a smaller configured limit; the printed HTTP error will show whether that is happening.
 

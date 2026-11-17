@@ -85,7 +85,9 @@ def main(argv=None):
                      type=int, default=600,
                      help='Seconds to wait for each chat/embedding HTTP response; --startup-timeout is an alias')
     dsh.add_argument('--debug', action='store_true',
-                     help='Print live per-step/tool progress and exception tracebacks')
+                     help='Print exception tracebacks and at least verbosity level 1')
+    dsh.add_argument('--verbosity', type=int, choices=(0, 1, 2), default=0,
+                     help='0: task results; 1: live step/tool progress; 2: include LLM text, tool arguments and observations')
 
     demo = commands.add_parser('demo', help='Offline end-to-end demo with hash vectors (not real embeddings)')
     demo.add_argument('--documents', type=Path, default=ROOT / 'src_data' / 'neo4j_documents_sample.jsonl')
@@ -168,7 +170,8 @@ def main(argv=None):
                       max_steps=args.max_steps, max_tokens=args.max_tokens,
                       embedding_base_url=args.embedding_base_url,
                       embedding_api_key=os.getenv(args.embedding_api_key_env, 'dummy'),
-                      request_timeout=args.request_timeout, debug=args.debug)
+                      request_timeout=args.request_timeout, debug=args.debug,
+                      verbosity=args.verbosity)
         return 1 if any(summary['statuses'].get(status, 0) for status in
                         ('llm_error', 'runtime_error', 'error', 'no_finish_reason')) else 0
 

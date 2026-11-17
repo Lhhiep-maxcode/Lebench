@@ -12,6 +12,7 @@ import urllib.error
 import urllib.request
 import uuid
 from contextlib import nullcontext
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .corpus import rows
@@ -124,7 +125,7 @@ def _assistant_message(raw):
 
 
 def run_task(sample, database, client, *, max_steps=24, workspace_root='output/rule_workspaces',
-             debug=False):
+             debug=False, verbosity=0):
     seed = sample.get('benchmark_seed') or {}
     facts, issues, laws = seed.get('facts_clean'), sample.get('issues'), sample.get('laws')
     if not isinstance(facts, str) or not facts.strip():
@@ -133,9 +134,19 @@ def run_task(sample, database, client, *, max_steps=24, workspace_root='output/r
         raise ValueError('Task requires a nonempty issues list')
     gold_citations(laws)  # Validate gold without adding it to model-visible messages.
     task_id = str(sample.get('id') or sample.get('doc_name') or 'task')
+    verbosity = max(verbosity, 1 if debug else 0)
+    def now():
+        return datetime.now(timezone.utc).isoformat(timespec='seconds')
+
     def log(message):
-        if debug:
-            print(f'[{task_id}] {message}', file=sys.stderr, flush=True)
+        if verbosity >= 1:
+            print(f'{now()} [{task_id}] {message}', file=sys.stderr, flush=True)
+
+    def detail(event, **fields):
+        if verbosity >= 2:
+            print('TRACE ' + json.dumps({'timestamp': now(), 'id': task_id,
+                                        'event': event, **fields},
+                                        ensure_ascii=False), file=sys.stderr, flush=True)
 
     session = ToolSession(database, workspace_root, task_id + '-' + uuid.uuid4().hex)
     messages = [
@@ -145,14 +156,19 @@ def run_task(sample, database, client, *, max_steps=24, workspace_root='output/r
     ]
     trace, status, error = [], 'max_steps', None
     log(f'start; max_steps={max_steps}')
+    detail('task_start', max_steps=max_steps)
     for step in range(1, max_steps + 1):
         log(f'step {step}: sending chat request')
+        detail('llm_request', step=step, message_count=len(messages))
         started = time.monotonic()
         try:
             assistant = _assistant_message(client.complete(messages))
         except Exception as exc:
             status, error = 'llm_error', f'{type(exc).__name__}: {exc}'
             log(f'step {step}: chat request failed after {time.monotonic() - started:.1f}s')
+            key = getattr(client, 'api_key', None)
+            safe_error = error.replace(key, '<redacted>') if key and key != 'dummy' else error
+            detail('llm_error', step=step, error=safe_error)
             if debug:
                 error += '\n' + traceback.format_exc()
             break
@@ -160,6 +176,8 @@ def run_task(sample, database, client, *, max_steps=24, workspace_root='output/r
         calls = assistant.get('tool_calls') or []
         log(f'step {step}: chat response after {time.monotonic() - started:.1f}s; '
             f'{len(calls)} tool call(s)')
+        detail('llm_response', step=step, content=assistant['content'],
+               reasoning_content=assistant['reasoning_content'], tool_call_count=len(calls))
         if not calls:
             status = 'no_tool_calls'
             break
@@ -171,6 +189,13 @@ def run_task(sample, database, client, *, max_steps=24, workspace_root='output/r
             trace_item = {'step': step, 'call_id': call_id, 'action': name,
                           'tool_called': True}
             log(f'step {step}: tool {name} started')
+            try:
+                display_arguments = (json.loads(raw_arguments) if isinstance(raw_arguments, str)
+                                     else raw_arguments)
+            except json.JSONDecodeError:
+                display_arguments = raw_arguments
+            detail('tool_call', step=step, call_id=call_id, name=name,
+                   arguments=display_arguments)
             tool_started = time.monotonic()
             try:
                 if name not in TOOL_NAMES:
@@ -203,12 +228,15 @@ def run_task(sample, database, client, *, max_steps=24, workspace_root='output/r
                 outcome = 'ok'
             log(f'step {step}: tool {name} finished after '
                 f'{time.monotonic() - tool_started:.1f}s; {outcome}')
+            detail('tool_result', step=step, call_id=call_id, name=name,
+                   observation=observation)
             messages.append({'role': 'tool', 'tool_call_id': call_id,
                              'content': json.dumps(observation, ensure_ascii=False),
                              'reasoning_content': ''})
         if status == 'submitted':
             break
     log(f'finished: {status}; {len(trace)} tool call(s)')
+    detail('task_end', status=status, tool_call_count=len(trace))
     selected = session.submitted or []
     score = score_submission(selected, laws, database)
     metrics = evaluate(selected, None, trace)
@@ -228,7 +256,7 @@ def run_task(sample, database, client, *, max_steps=24, workspace_root='output/r
 def run_benchmark(tasks, output, *, final_dir, workspace_root, base_url, model,
                   api_key='dummy', embedding_base_url=None,
                   embedding_api_key='dummy', max_steps=24, max_tokens=4096,
-                  request_timeout=600, conversation_output=None, debug=False):
+                  request_timeout=600, conversation_output=None, debug=False, verbosity=0):
     final_dir, tasks, output = Path(final_dir), Path(tasks), Path(output)
     manifest = json.loads((final_dir / 'manifest.json').read_text(encoding='utf-8'))
     if manifest.get('version') != 2:
@@ -263,7 +291,8 @@ def run_benchmark(tasks, output, *, final_dir, workspace_root, base_url, model,
             private_text_output(output) as result_stream, conversation_context as conversation_stream:
         for sample in rows(tasks):
             result = run_task(sample, database, client, max_steps=max_steps,
-                              workspace_root=workspace_root, debug=debug)
+                              workspace_root=workspace_root, debug=debug,
+                              verbosity=verbosity)
             conversation = result.pop('conversation')
             result_stream.write(json.dumps(result, ensure_ascii=False) + '\n')
             result_stream.flush()
