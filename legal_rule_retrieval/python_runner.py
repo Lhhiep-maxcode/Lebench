@@ -211,6 +211,16 @@ def run_benchmark(tasks, output, *, final_dir, workspace_root, base_url, model,
     embedder = make_embedder(manifest['backend'], manifest['embedding_model'],
                              embedding_base_url, embedding_api_key, request_timeout)
     client = ChatClient(base_url, model, api_key, request_timeout, max_tokens)
+    print(f'Chat endpoint: {client.url} (model={model})', file=sys.stderr, flush=True)
+    embedding_endpoint = getattr(embedder, 'url', None)
+    if embedding_endpoint:
+        print(f'Embedding endpoint: {embedding_endpoint} '
+              f'(model={manifest["embedding_model"]})', file=sys.stderr, flush=True)
+    else:
+        print(f'Embedding backend: {manifest["backend"]} '
+              f'(model={manifest["embedding_model"]})', file=sys.stderr, flush=True)
+    if debug:
+        print(f'Runner source: {Path(__file__).resolve()}', file=sys.stderr, flush=True)
     protected = {tasks.resolve(), (final_dir / 'rules.jsonl').resolve(),
                  (final_dir / 'index.faiss').resolve(), (final_dir / 'manifest.json').resolve()}
     if output.resolve() in protected:
