@@ -82,8 +82,11 @@ def main(argv=None):
     dsh.add_argument('--max-steps', type=int, default=12)
     dsh.add_argument('--max-tokens', type=int, default=4096)
     dsh.add_argument('--context-window', type=int, default=131072)
+    dsh.add_argument('--startup-timeout', type=int, default=300,
+                     help='Seconds to wait for DeepSeek Harness initialization (default: 300)')
     dsh.add_argument('--memory-sessions', action='store_true',
                      help='Do not persist DeepSeek sessions; useful if native session storage is unavailable')
+    dsh.add_argument('--debug', action='store_true', help='Print and save runtime exception tracebacks')
 
     demo = commands.add_parser('demo', help='Offline end-to-end demo with hash vectors (not real embeddings)')
     demo.add_argument('--documents', type=Path, default=ROOT / 'src_data' / 'neo4j_documents_sample.jsonl')
@@ -143,6 +146,10 @@ def main(argv=None):
             parser.error('Vector index missing; run embed first')
         if args.max_steps < 1 or args.max_tokens < 1 or args.context_window < 4096:
             parser.error('--max-steps and --max-tokens must be positive; --context-window >= 4096')
+        if args.max_tokens >= args.context_window:
+            parser.error('--max-tokens must be smaller than --context-window')
+        if not 60 <= args.startup_timeout <= 3600:
+            parser.error('--startup-timeout must be between 60 and 3600 seconds')
         protected = {args.tasks.resolve(), (args.rules_dir / 'rules.jsonl').resolve(),
                      (args.index_dir / 'index.faiss').resolve(),
                      (args.index_dir / 'manifest.json').resolve()}
@@ -160,7 +167,8 @@ def main(argv=None):
                       context_window=args.context_window,
                       embedding_base_url=args.embedding_base_url,
                       embedding_api_key_env=args.embedding_api_key_env,
-                      dsh_bin=args.dsh_bin, memory_sessions=args.memory_sessions)
+                      dsh_bin=args.dsh_bin, memory_sessions=args.memory_sessions,
+                      debug=args.debug, startup_timeout_seconds=args.startup_timeout)
         return 1 if any(summary['statuses'].get(status, 0) for status in
                         ('runtime_error', 'error', 'no_finish_reason')) else 0
 

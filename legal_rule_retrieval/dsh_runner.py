@@ -4,6 +4,7 @@ import json
 import re
 import sys
 import tempfile
+import traceback
 import uuid
 from pathlib import Path
 
@@ -36,12 +37,17 @@ def _yaml_string(value):
 def write_patch(path, *, rules_dir, index_dir, workspace_root, task_id,
                 submission_path, base_url, model, context_window=131072,
                 embedding_base_url=None, embedding_api_key_env='EMBEDDING_API_KEY',
-                memory_sessions=False, gold_path=None):
+                memory_sessions=False, gold_path=None, max_tokens=None,
+                startup_timeout_seconds=300):
     """Use the shipped sdk-minimal profile, exposing only the legal MCP tools."""
     if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', embedding_api_key_env):
         raise ValueError('Invalid embedding API key environment variable name')
     if context_window < 4096:
         raise ValueError('context_window must be at least 4096')
+    if max_tokens is not None and not 0 < max_tokens < context_window:
+        raise ValueError('max_tokens must be positive and smaller than context_window')
+    if startup_timeout_seconds < 60:
+        raise ValueError('startup_timeout_seconds must be at least 60')
     base_url = api_base_url(base_url)
     if embedding_base_url:
         embedding_base_url = api_base_url(embedding_base_url)
@@ -79,7 +85,7 @@ def write_patch(path, *, rules_dir, index_dir, workspace_root, task_id,
         '            models:',
         '              - id: ' + _yaml_string(model),
         '                contextWindow: ' + str(context_window),
-        '                maxTokens: ' + str(min(8192, context_window // 4)),
+        '                maxTokens: ' + str(max_tokens if max_tokens is not None else min(8192, context_window // 4)),
         '    - id: legal-rules-mcp',
         "      name: '@deepseek-ai/dsh-mcp-client'",
         '      config:',
@@ -89,7 +95,7 @@ def write_patch(path, *, rules_dir, index_dir, workspace_root, task_id,
         '        args: ' + json.dumps(args, ensure_ascii=False),
         '        cwd: ' + _yaml_string(REPO_ROOT),
         '        failOnStartupError: true',
-        '        startupTimeoutMs: 120000',
+        '        startupTimeoutMs: ' + str(int((startup_timeout_seconds - 30) * 1000)),
         '        toolCallTimeoutMs: 120000',
         '        env:',
         f"          {embedding_api_key_env}: !!js process.env.{embedding_api_key_env} || 'dummy'",
@@ -198,7 +204,8 @@ def run_task_dsh(sample, *, rules_dir, index_dir, workspace_root, dsh_home,
                  base_url, model, api_key, max_steps=12, max_tokens=4096,
                  context_window=131072,
                  embedding_base_url=None, embedding_api_key_env='EMBEDDING_API_KEY',
-                 dsh_bin=None, memory_sessions=False):
+                 dsh_bin=None, memory_sessions=False, debug=False,
+                 startup_timeout_seconds=300):
     """One independent DSH runtime/MCP process per task prevents cross-task state leaks."""
     if max_steps < 1:
         raise ValueError('max_steps must be positive')
@@ -217,7 +224,7 @@ def run_task_dsh(sample, *, rules_dir, index_dir, workspace_root, dsh_home,
     dsh_root.mkdir(parents=True, exist_ok=True)
     events, finish_reason, final_response = [], None, ''
     status = 'error'
-    error = None
+    error, error_traceback = None, None
     session_id = 'legal-' + uuid.uuid4().hex
     task_home = dsh_root / session_id
     task_home.mkdir(mode=0o700)
@@ -237,7 +244,9 @@ def run_task_dsh(sample, *, rules_dir, index_dir, workspace_root, dsh_home,
                     embedding_base_url=embedding_base_url,
                     embedding_api_key_env=embedding_api_key_env,
                     memory_sessions=memory_sessions,
-                    gold_path=gold_path if final_mode else None)
+                    gold_path=gold_path if final_mode else None,
+                    max_tokens=max_tokens,
+                    startup_timeout_seconds=startup_timeout_seconds)
         try:
             from deepseek_harness import DeepSeekHarness
         except ImportError as exc:
@@ -253,10 +262,14 @@ def run_task_dsh(sample, *, rules_dir, index_dir, workspace_root, dsh_home,
                 events.append(event)
                 if event.get('type') == 'request/header':
                     header = (event.get('data') or {}).get('header') or {}
-                    names = {tool.get('name') for tool in header.get('tools', [])}
-                    if (names != (FINAL_LEGAL_TOOLS if final_mode else LEGAL_TOOLS) or
-                            (header.get('config') or {}).get('provider') != 'legal-vllm'):
-                        raise RuntimeError('Unexpected model route or tool set; refusing benchmark run')
+                    names = {str(tool.get('name')) for tool in header.get('tools', [])
+                             if isinstance(tool, dict)}
+                    expected = FINAL_LEGAL_TOOLS if final_mode else LEGAL_TOOLS
+                    provider = (header.get('config') or {}).get('provider')
+                    if names != expected or provider != 'legal-vllm':
+                        raise RuntimeError('Unexpected model route or tool set: '
+                                           f'provider={provider!r}, missing={sorted(expected - names)!r}, '
+                                           f'extra={sorted(names - expected)!r}')
                 if event.get('type') == 'step/start':
                     steps = sum(item.get('type') == 'step/start' for item in events)
                     if steps > max_steps:
@@ -279,10 +292,13 @@ def run_task_dsh(sample, *, rules_dir, index_dir, workspace_root, dsh_home,
                            'NO_PROXY': '*', 'no_proxy': '*', **proxy_env}}
         if max_tokens is not None:
             options['max_tokens'] = max_tokens
+        options['initialize_timeout_seconds'] = startup_timeout_seconds
         if dsh_bin:
             options['dsh_bin'] = str(Path(dsh_bin).resolve())
+        harness = None
         try:
-            with DeepSeekHarness(**options) as harness:
+            harness = DeepSeekHarness(**options)
+            with harness:
                 result = harness.run(prompt, session_id=session_id,
                                      on_notification=record)
                 finish_reason, final_response = result.finish_reason, result.final_response
@@ -291,6 +307,14 @@ def run_task_dsh(sample, *, rules_dir, index_dir, workspace_root, dsh_home,
             status, error = 'max_steps', str(exc)
         except Exception as exc:
             status, error = 'runtime_error', f'{type(exc).__name__}: {exc}'
+            if isinstance(exc, TimeoutError) and harness is not None:
+                diagnostics = getattr(harness.client, '_runtime_diagnostics', None)
+                if callable(diagnostics):
+                    tail = diagnostics()
+                    if tail:
+                        error += '\nRuntime stderr tail:\n' + tail[-4000:]
+            if debug:
+                error_traceback = traceback.format_exc()
         selected, submission_score = [], None
         if submission.exists():
             submitted = json.loads(submission.read_text(encoding='utf-8'))
@@ -327,7 +351,10 @@ def run_task_dsh(sample, *, rules_dir, index_dir, workspace_root, dsh_home,
     if final_mode and submission_score:
         result['submission_score'] = submission_score
     if error:
-        result['error'] = error
+        error_text = error if isinstance(error, str) else json.dumps(error, ensure_ascii=False)
+        result['error'] = error_text.replace(api_key, '<redacted>') if api_key and api_key != 'dummy' else error_text
+    if error_traceback:
+        result['error_traceback'] = error_traceback.replace(api_key, '<redacted>') if api_key and api_key != 'dummy' else error_traceback
     return result
 
 
@@ -353,7 +380,11 @@ def run_benchmark(tasks, output, conversation_output=None, **kwargs):
                 conversation_stream.flush()
             results.append({'metrics': result['metrics'], 'status': result['status']})
             print(f"{result['id']}: {result['status']}, F1={result['metrics'].get('f1', 'n/a')}, "
-                  f"tools={result['metrics']['tool_calls']}")
+                  f"tools={result['metrics']['tool_calls']}", flush=True)
+            if result.get('error'):
+                print(f"  error: {result['error']}", file=sys.stderr, flush=True)
+            if result.get('error_traceback'):
+                print(result['error_traceback'], file=sys.stderr, flush=True)
     summary = aggregate(results)
     summary['statuses'] = {status: sum(item['status'] == status for item in results)
                            for status in sorted({item['status'] for item in results})}

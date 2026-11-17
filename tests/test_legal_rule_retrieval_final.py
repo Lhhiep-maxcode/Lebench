@@ -1,16 +1,19 @@
 """Final-corpus preparation, article scoring, and chat-template trace conversion."""
 
 import asyncio
+import contextlib
+import io
 import json
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
-from legal_rule_retrieval.dsh_runner import conversation_from_events
+from legal_rule_retrieval.dsh_runner import conversation_from_events, run_benchmark, run_task_dsh
 from legal_rule_retrieval.final_data import FinalRuleDatabase, prepare_final, score_submission
 from legal_rule_retrieval.vectors import HashEmbedder
 
@@ -58,6 +61,10 @@ class FinalCorpusTests(unittest.TestCase):
             self.assertEqual(len(row['emb_vector']), 256)
         with FinalRuleDatabase(self.directory, HashEmbedder()) as database:
             self.assertEqual(len(database.search('Bộ luật Lao động', 2)), 2)
+            hits = database.search('Bộ luật Lao động 2020 Nghĩa vụ', 3)
+            labor_scores = [hit['score'] for hit in hits if hit['title'] == self.rows[0]['title']]
+            self.assertEqual(len(labor_scores), 2)
+            self.assertAlmostEqual(labor_scores[0], labor_scores[1])
             self.assertEqual(database.get(self.rows[0]['identifier'])['arbitrary_field'], {'x': [1, 2]})
             self.assertEqual(database.check_validity(self.rows[0]['identifier'], '2021-01-01',
                                                      '2022-01-01')['status'], 'valid')
@@ -128,6 +135,52 @@ class FinalCorpusTests(unittest.TestCase):
                     self.assertEqual((data['precision'], data['recall']), (1.0, 1.0))
         asyncio.run(run())
         self.assertEqual(json.loads(submission.read_text(encoding='utf-8'))['true_positives'], 1)
+
+    def test_benchmark_prints_saved_runtime_error(self):
+        tasks = self.root / 'tasks.jsonl'
+        tasks.write_text('{"doc_name":"failed-task"}\n', encoding='utf-8')
+        result = {'id': 'failed-task', 'status': 'runtime_error', 'error': 'RuntimeError: startup failed',
+                  'conversation': {'messages': [], 'tools': []},
+                  'metrics': {'tool_calls': 0, 'work_calls': 0, 'retrieval_calls': 0,
+                              'tool_call_efficiency': 0.0, 'true_positives': 0,
+                              'predicted_count': 0, 'gold_count': 1, 'precision': 0.0,
+                              'recall': 0.0, 'f1': 0.0}}
+        stderr = io.StringIO()
+        with patch('legal_rule_retrieval.dsh_runner.run_task_dsh', return_value=result), \
+                contextlib.redirect_stderr(stderr):
+            run_benchmark(tasks, self.root / 'results.jsonl')
+        self.assertIn('error: RuntimeError: startup failed', stderr.getvalue())
+        saved = json.loads((self.root / 'results.jsonl').read_text(encoding='utf-8').splitlines()[0])
+        self.assertEqual(saved['error'], result['error'])
+
+    def test_startup_timeout_is_configured_and_diagnosed(self):
+        prepare_final(self.source, self.directory, HashEmbedder(), 'hash')
+
+        class SlowHarness:
+            class Client:
+                @staticmethod
+                def _runtime_diagnostics():
+                    return 'MCP startup still loading corpus'
+
+            client = Client()
+
+            def __enter__(self):
+                raise TimeoutError('initialize timed out waiting for DeepSeek Harness runtime')
+
+            def __exit__(self, *_):
+                pass
+
+        sample = {'doc_name': 'slow', 'benchmark_seed': {'facts_clean': 'Facts.'},
+                  'issues': ['Issue?'], 'laws': []}
+        with patch('deepseek_harness.DeepSeekHarness', return_value=SlowHarness()) as constructor:
+            result = run_task_dsh(sample, rules_dir=self.directory, index_dir=self.directory,
+                                  workspace_root=self.root / 'workspace',
+                                  dsh_home=self.root / 'dsh-home',
+                                  base_url='http://127.0.0.1:9/v1', model='mock',
+                                  api_key='dummy', startup_timeout_seconds=300)
+        self.assertEqual(constructor.call_args.kwargs['initialize_timeout_seconds'], 300)
+        self.assertEqual(result['status'], 'runtime_error')
+        self.assertIn('MCP startup still loading corpus', result['error'])
 
 
 if __name__ == '__main__':

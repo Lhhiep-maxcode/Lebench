@@ -100,8 +100,15 @@ class DeepSeekIntegrationTests(unittest.TestCase):
         self.assertIn("name: '@deepseek-ai/dsh-llm-pi-ai'", text)
         self.assertIn('api: openai-completions', text)
         self.assertIn('serverName: legal_rules', text)
+        self.assertIn('startupTimeoutMs: 270000', text)
         self.assertIn('- id: llm-deepseek\n  disabled: true', text)
         self.assertIn('- id: persistent-pwsh\n  disabled: true', text)
+        write_patch(patch, rules_dir=self.rules, index_dir=self.index,
+                    workspace_root=self.workspace, task_id='case-1',
+                    submission_path=self.submission,
+                    base_url='http://127.0.0.1:8000/v1', model='local-chat',
+                    max_tokens=65536, context_window=131072)
+        self.assertIn('maxTokens: 65536', patch.read_text(encoding='utf-8'))
         write_patch(patch, rules_dir=self.rules, index_dir=self.index,
                     workspace_root=self.workspace, task_id='case-1',
                     submission_path=self.submission,

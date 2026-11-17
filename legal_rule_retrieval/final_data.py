@@ -97,7 +97,6 @@ class FinalRuleDatabase:
                 raise ValueError('Final corpus changed or has an unsupported manifest')
             self.index = faiss.read_index(str(directory / 'index.faiss'))
             self.offsets, self.id_to_row = [], {}
-            self.title_to_rows, title_vectors = {}, []
             while line := self.source.readline():
                 offset = self.source.tell() - len(line)
                 row = json.loads(line)
@@ -105,18 +104,9 @@ class FinalRuleDatabase:
                 if identifier in self.id_to_row:
                     raise ValueError('Duplicate identifier: ' + identifier)
                 self.id_to_row[identifier] = len(self.offsets)
-                if row['title'] not in self.title_to_rows:
-                    self.title_to_rows[row['title']] = []
-                    title_vectors.append(row['emb_vector'])
-                self.title_to_rows[row['title']].append(len(self.offsets))
                 self.offsets.append(offset)
             if len(self.offsets) != self.index.ntotal or self.index.d != self.manifest['dimension']:
                 raise ValueError('Final corpus and vector index do not align')
-            self.titles = list(self.title_to_rows)
-            self.title_index = faiss.IndexFlatIP(self.index.d)
-            unique_vectors = np.ascontiguousarray(np.asarray(title_vectors, dtype=np.float32))
-            faiss.normalize_L2(unique_vectors)
-            self.title_index.add(unique_vectors)
             self.embedder = embedder
         except Exception:
             self.source.close()
@@ -149,30 +139,19 @@ class FinalRuleDatabase:
         if vector.shape != (1, self.index.d) or not np.isfinite(vector).all() or np.linalg.norm(vector) == 0:
             raise ValueError('Invalid query embedding')
         faiss.normalize_L2(vector)
-        # One title vector is shared by every part of a document. Search distinct
-        # titles first so a long document cannot crowd every other document out.
-        title_count = min(len(self.titles), max(20, top_k * 5))
-        scores, positions = self.title_index.search(np.ascontiguousarray(vector), title_count)
-        query_words = set(fold(query).split()) - {'va', 'cua', 'cho', 'theo', 'trong', 've', 'la'}
-        requested_article = article(query)
-        candidates = []
-        for title_score, position in zip(scores[0], positions[0]):
+        scores, positions = self.index.search(np.ascontiguousarray(vector), min(top_k, self.index.ntotal))
+        results = []
+        for score, position in zip(scores[0], positions[0]):
             if position < 0:
                 continue
-            title = self.titles[int(position)]
-            for row_number in self.title_to_rows[title]:
-                row = self.by_row(row_number)
-                content_words = set(fold(str(row.get('content') or '')).split())
-                overlap = len(query_words & content_words) / max(1, len(query_words))
-                article_bonus = 0.5 if requested_article and article(row['identifier']) == requested_article else 0
-                combined = float(title_score) + 0.2 * overlap + article_bonus
-                candidates.append((combined, row))
-        candidates.sort(key=lambda item: item[0], reverse=True)
-        return [{'rule_id': row['identifier'], 'title': row['title'],
-                 'part_type': row.get('partType'), 'effective_date': row.get('effectiveDate'),
-                 'expiration_date': row.get('expirationDate'), 'score': score,
-                 'preview': str(row.get('content') or '')[:320]}
-                for score, row in candidates[:top_k]]
+            row = self.by_row(int(position))
+            results.append({'rule_id': row['identifier'], 'title': row['title'],
+                            'part_type': row.get('partType'),
+                            'effective_date': row.get('effectiveDate'),
+                            'expiration_date': row.get('expirationDate'),
+                            'score': float(score),
+                            'preview': str(row.get('content') or '')[:320]})
+        return results
 
     def check_validity(self, rule_id, start, end):
         row = self.get(rule_id)
