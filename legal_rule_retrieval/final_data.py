@@ -88,7 +88,9 @@ def prepare_final(source, output_dir, embedder, backend, model=None, batch_size=
 
 
 class FinalRuleDatabase:
-    def __init__(self, directory, embedder):
+    def __init__(self, directory, embedder, max_rules=None):
+        if max_rules is not None and (type(max_rules) is not int or max_rules < 1):
+            raise ValueError('max_rules must be a positive integer')
         directory = Path(directory)
         self.path = directory / 'rules.jsonl'
         self.source = self.path.open('rb')
@@ -96,13 +98,39 @@ class FinalRuleDatabase:
             self.manifest = json.loads((directory / 'manifest.json').read_text(encoding='utf-8'))
             if self.manifest.get('version') != 2:
                 raise ValueError('Final corpus changed or has an unsupported manifest')
-            expected_hash = self.manifest['rules_sha256']
+            partial = max_rules is not None and max_rules < self.manifest['rules']
+            limit = max_rules if partial else self.manifest['rules']
             self.offsets, self.id_to_row = [], {}
-            digest = hashlib.sha256()
-            print(f'Loading {self.manifest["rules"]} legal parts from {self.path}...', flush=True)
-            with tqdm(total=self.manifest['rules'], desc='Loading legal parts', unit='part') as progress:
-                while line := self.source.readline():
-                    digest.update(line)
+            digest = hashlib.sha256() if not partial else None
+            vectors = []
+            if partial:
+                self.index = faiss.IndexFlatIP(self.manifest['dimension'])
+                print(f'Debug subset: loading first {limit} of {self.manifest["rules"]} legal parts; '
+                      'retrieval is limited to these parts and the full-file checksum is skipped.',
+                      flush=True)
+            else:
+                print(f'Loading {self.manifest["rules"]} legal parts from {self.path}...', flush=True)
+
+            def add_vectors():
+                if not vectors:
+                    return
+                matrix = np.asarray(vectors, dtype=np.float32)
+                if (matrix.shape != (len(vectors), self.index.d) or
+                        not np.isfinite(matrix).all() or
+                        np.any(np.linalg.norm(matrix, axis=1) == 0)):
+                    raise ValueError('Invalid stored embedding in debug subset')
+                matrix = np.ascontiguousarray(matrix)
+                faiss.normalize_L2(matrix)
+                self.index.add(matrix)
+                vectors.clear()
+
+            with tqdm(total=limit, desc='Loading legal parts', unit='part') as progress:
+                while not partial or len(self.offsets) < limit:
+                    line = self.source.readline()
+                    if not line:
+                        break
+                    if digest is not None:
+                        digest.update(line)
                     offset = self.source.tell() - len(line)
                     row = json.loads(line)
                     identifier = row['identifier']
@@ -110,13 +138,19 @@ class FinalRuleDatabase:
                         raise ValueError('Duplicate identifier: ' + identifier)
                     self.id_to_row[identifier] = len(self.offsets)
                     self.offsets.append(offset)
+                    if partial:
+                        vectors.append(row['emb_vector'])
+                        if len(vectors) == 512:
+                            add_vectors()
                     progress.update(1)
-            if digest.hexdigest() != expected_hash:
-                raise ValueError('Final corpus changed or has an unsupported manifest')
-            print('Loading FAISS index...', flush=True)
-            self.index = faiss.read_index(str(directory / 'index.faiss'))
-            if (len(self.offsets) != self.manifest['rules'] or
-                    len(self.offsets) != self.index.ntotal or
+            if partial:
+                add_vectors()
+            else:
+                if digest.hexdigest() != self.manifest['rules_sha256']:
+                    raise ValueError('Final corpus changed or has an unsupported manifest')
+                print('Loading FAISS index...', flush=True)
+                self.index = faiss.read_index(str(directory / 'index.faiss'))
+            if (len(self.offsets) != limit or len(self.offsets) != self.index.ntotal or
                     self.index.d != self.manifest['dimension']):
                 raise ValueError('Final corpus and vector index do not align')
             self.embedder = embedder

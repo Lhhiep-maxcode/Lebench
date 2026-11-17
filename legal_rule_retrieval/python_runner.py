@@ -256,7 +256,8 @@ def run_task(sample, database, client, *, max_steps=24, workspace_root='output/r
 def run_benchmark(tasks, output, *, final_dir, workspace_root, base_url, model,
                   api_key='dummy', embedding_base_url=None,
                   embedding_api_key='dummy', max_steps=24, max_tokens=4096,
-                  request_timeout=600, conversation_output=None, debug=False, verbosity=0):
+                  request_timeout=600, conversation_output=None, debug=False, verbosity=0,
+                  max_rules=None):
     final_dir, tasks, output = Path(final_dir), Path(tasks), Path(output)
     manifest = json.loads((final_dir / 'manifest.json').read_text(encoding='utf-8'))
     if manifest.get('version') != 2:
@@ -287,7 +288,7 @@ def run_benchmark(tasks, output, *, final_dir, workspace_root, base_url, model,
     conversation_context = (private_text_output(conversation_output) if conversation_output
                             else nullcontext(None))
     results = []
-    with FinalRuleDatabase(final_dir, embedder) as database, \
+    with FinalRuleDatabase(final_dir, embedder, max_rules=max_rules) as database, \
             private_text_output(output) as result_stream, conversation_context as conversation_stream:
         for sample in rows(tasks):
             result = run_task(sample, database, client, max_steps=max_steps,

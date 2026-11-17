@@ -68,6 +68,8 @@ def main(argv=None):
     dsh.add_argument('--rules-dir', type=Path, default=ROOT / 'output' / 'legal_rule_corpus')
     dsh.add_argument('--index-dir', type=Path, default=ROOT / 'output' / 'legal_rule_index')
     dsh.add_argument('--final-dir', type=Path, help='Single-file final corpus prepared by prepare-final')
+    dsh.add_argument('--max-rules', type=int,
+                     help='Debug: load only the first N legal parts into a temporary search index')
     dsh.add_argument('--tasks', type=Path, required=True)
     dsh.add_argument('--output', type=Path, default=ROOT / 'output' / 'rule_retrieval_dsh.jsonl')
     dsh.add_argument('--conversation-output', type=Path,
@@ -153,6 +155,8 @@ def main(argv=None):
             parser.error('--max-tokens must be smaller than --context-window')
         if not 1 <= args.request_timeout <= 3600:
             parser.error('--request-timeout must be between 1 and 3600 seconds')
+        if args.max_rules is not None and args.max_rules < 1:
+            parser.error('--max-rules must be positive')
         protected = {args.tasks.resolve(), (args.rules_dir / 'rules.jsonl').resolve(),
                      (args.index_dir / 'index.faiss').resolve(),
                      (args.index_dir / 'manifest.json').resolve()}
@@ -171,7 +175,7 @@ def main(argv=None):
                       embedding_base_url=args.embedding_base_url,
                       embedding_api_key=os.getenv(args.embedding_api_key_env, 'dummy'),
                       request_timeout=args.request_timeout, debug=args.debug,
-                      verbosity=args.verbosity)
+                      verbosity=args.verbosity, max_rules=args.max_rules)
         return 1 if any(summary['statuses'].get(status, 0) for status in
                         ('llm_error', 'runtime_error', 'error', 'no_finish_reason')) else 0
 

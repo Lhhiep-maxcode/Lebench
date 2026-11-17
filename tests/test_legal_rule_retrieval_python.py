@@ -8,6 +8,7 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from unittest.mock import patch
 
 from legal_rule_retrieval.final_data import FinalRuleDatabase, prepare_final
 from legal_rule_retrieval.python_runner import ChatClient, TOOLS, run_task
@@ -32,6 +33,27 @@ class ScriptedClient:
 
 
 class DirectRunnerTests(unittest.TestCase):
+    def test_partial_load_uses_only_prefix_and_builds_its_own_index(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / 'parts.jsonl'
+            rules = [{'identifier': f'Rule {number}', 'title': f'Law {number}',
+                      'content': f'Article {number}'} for number in range(3)]
+            source.write_text(''.join(json.dumps(row) + '\n' for row in rules), encoding='utf-8')
+            prepared = root / 'prepared'
+            prepare_final(source, prepared, HashEmbedder(), 'hash')
+
+            with patch('legal_rule_retrieval.final_data.faiss.read_index',
+                       side_effect=AssertionError('full index must not be read')):
+                with FinalRuleDatabase(prepared, HashEmbedder(), max_rules=2) as database:
+                    self.assertEqual(database.index.ntotal, 2)
+                    self.assertLess(database.source.tell(), (prepared / 'rules.jsonl').stat().st_size)
+                    self.assertIsNone(database.get('Rule 2'))
+                    self.assertEqual({hit['rule_id'] for hit in database.search('Law 1', top_k=3)},
+                                     {'Rule 0', 'Rule 1'})
+            with self.assertRaisesRegex(ValueError, 'max_rules must be a positive integer'):
+                FinalRuleDatabase(prepared, HashEmbedder(), max_rules=0)
+
     def test_chat_client_sends_native_tool_schemas(self):
         received = []
 
