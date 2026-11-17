@@ -2,6 +2,8 @@
 
 For the new **single-file** `neo4j_parts_final.jsonl` corpus and nested `laws[*].provisions` benchmark, use [README-legal-rule-retrieval-final.md](README-legal-rule-retrieval-final.md). The workflow below documents the older two-file corpus.
 
+The old DeepSeek SDK instructions below are archived. The current `run-dsh` command is an alias for the direct Python `run-python` command and requires `--final-dir`; it does not start the SDK or MCP server. The older two-file `prepare`, `embed`, and `run` commands remain available.
+
 End-to-end workflow for the supplied Neo4j JSONL exports:
 
 ```text

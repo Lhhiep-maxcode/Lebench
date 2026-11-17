@@ -10,8 +10,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from mcp import ClientSession
-from mcp.client.stdio import StdioServerParameters, stdio_client
+try:
+    from mcp import ClientSession
+    from mcp.client.stdio import StdioServerParameters, stdio_client
+except ImportError:  # The active direct runner does not require MCP.
+    ClientSession = StdioServerParameters = stdio_client = None
 
 from legal_rule_retrieval.dsh_runner import conversation_from_events, run_benchmark, run_task_dsh
 from legal_rule_retrieval.final_data import FinalRuleDatabase, prepare_final, score_submission
@@ -109,6 +112,7 @@ class FinalCorpusTests(unittest.TestCase):
         self.assertEqual(conversation['messages'][3]['tool_call_id'], 'call_1')
         self.assertTrue(all('reasoning_content' in message for message in conversation['messages']))
 
+    @unittest.skipUnless(ClientSession is not None, 'Optional legacy MCP dependency is not installed')
     def test_final_mcp_submit_returns_score(self):
         prepare_final(self.source, self.directory, HashEmbedder(), 'hash')
         gold_path = self.root / 'gold.json'

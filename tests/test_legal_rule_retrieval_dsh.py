@@ -7,8 +7,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from mcp import ClientSession
-from mcp.client.stdio import StdioServerParameters, stdio_client
+try:
+    from mcp import ClientSession
+    from mcp.client.stdio import StdioServerParameters, stdio_client
+except ImportError:  # Legacy SDK/MCP tests are optional for the direct runner.
+    ClientSession = StdioServerParameters = stdio_client = None
 
 from legal_rule_retrieval.corpus import prepare
 from legal_rule_retrieval.dsh_runner import trace_from_events, write_patch
@@ -19,6 +22,7 @@ RULE_ID = 'Điều 5, 01/2020/NĐ-CP'
 DOC_ID = '01/2020/NĐ-CP'
 
 
+@unittest.skipUnless(ClientSession is not None, 'Optional legacy MCP dependency is not installed')
 class DeepSeekIntegrationTests(unittest.TestCase):
     @staticmethod
     def payload(result):

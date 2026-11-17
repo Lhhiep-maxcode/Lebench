@@ -224,7 +224,7 @@ class ToolSession:
 def evaluate(submitted, gold, trace):
     tool_calls = sum(1 for step in trace if step.get('tool_called'))
     work_calls = sum(1 for step in trace if step.get('tool_called')
-                     and step.get('action') != 'submit_rules')
+                     and step.get('action') not in ('submit_rules', 'submit'))
     retrieval_calls = sum(1 for step in trace if step.get('action') in ('search_legal_rules', 'get_legal_rule')
                           and step.get('tool_called'))
     failed_calls = sum(1 for step in trace if step.get('tool_called') and 'error' in step.get('observation', {}))

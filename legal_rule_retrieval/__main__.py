@@ -63,7 +63,8 @@ def main(argv=None):
     run.add_argument('--timeout', type=float, default=120)
     run.add_argument('--max-steps', type=int, default=8)
 
-    dsh = commands.add_parser('run-dsh', help='Run benchmark through DeepSeek Harness SDK + legal MCP tools')
+    dsh = commands.add_parser('run-python', aliases=['run-dsh'],
+                              help='Run the legal tool loop directly in Python; run-dsh is an alias')
     dsh.add_argument('--rules-dir', type=Path, default=ROOT / 'output' / 'legal_rule_corpus')
     dsh.add_argument('--index-dir', type=Path, default=ROOT / 'output' / 'legal_rule_index')
     dsh.add_argument('--final-dir', type=Path, help='Single-file final corpus prepared by prepare-final')
@@ -72,8 +73,6 @@ def main(argv=None):
     dsh.add_argument('--conversation-output', type=Path,
                      help='Optional OpenAI chat-template JSONL with messages, tools, and reasoning_content')
     dsh.add_argument('--workspace-root', type=Path, default=ROOT / 'output' / 'rule_workspaces')
-    dsh.add_argument('--dsh-home', type=Path, default=ROOT / 'output' / 'legal_dsh_home')
-    dsh.add_argument('--dsh-bin', type=Path, help='Optional dsh executable built from your clone')
     dsh.add_argument('--base-url', required=True, help='DeepSeek-compatible chat API base URL')
     dsh.add_argument('--model', required=True)
     dsh.add_argument('--api-key-env', default='VLLM_API_KEY')
@@ -82,10 +81,9 @@ def main(argv=None):
     dsh.add_argument('--max-steps', type=int, default=12)
     dsh.add_argument('--max-tokens', type=int, default=4096)
     dsh.add_argument('--context-window', type=int, default=131072)
-    dsh.add_argument('--startup-timeout', type=int, default=300,
-                     help='Seconds to wait for DeepSeek Harness initialization (default: 300)')
-    dsh.add_argument('--memory-sessions', action='store_true',
-                     help='Do not persist DeepSeek sessions; useful if native session storage is unavailable')
+    dsh.add_argument('--request-timeout', '--startup-timeout', dest='request_timeout',
+                     type=int, default=600,
+                     help='Seconds to wait for each chat/embedding HTTP response; --startup-timeout is an alias')
     dsh.add_argument('--debug', action='store_true', help='Print and save runtime exception tracebacks')
 
     demo = commands.add_parser('demo', help='Offline end-to-end demo with hash vectors (not real embeddings)')
@@ -136,8 +134,10 @@ def main(argv=None):
         print('Index:', json.dumps(manifest, ensure_ascii=False))
         return 0
 
-    if args.command == 'run-dsh':
-        from .dsh_runner import run_benchmark
+    if args.command in ('run-python', 'run-dsh'):
+        from .python_runner import run_benchmark
+        if not args.final_dir:
+            parser.error('--final-dir is required for the direct Python runner')
         if args.final_dir:
             args.rules_dir = args.index_dir = args.final_dir
         if not args.tasks.is_file() or not (args.rules_dir / 'rules.jsonl').is_file():
@@ -148,8 +148,8 @@ def main(argv=None):
             parser.error('--max-steps and --max-tokens must be positive; --context-window >= 4096')
         if args.max_tokens >= args.context_window:
             parser.error('--max-tokens must be smaller than --context-window')
-        if not 60 <= args.startup_timeout <= 3600:
-            parser.error('--startup-timeout must be between 60 and 3600 seconds')
+        if not 1 <= args.request_timeout <= 3600:
+            parser.error('--request-timeout must be between 1 and 3600 seconds')
         protected = {args.tasks.resolve(), (args.rules_dir / 'rules.jsonl').resolve(),
                      (args.index_dir / 'index.faiss').resolve(),
                      (args.index_dir / 'manifest.json').resolve()}
@@ -157,20 +157,19 @@ def main(argv=None):
             parser.error('Result output must differ from tasks, rules, and index')
         if args.conversation_output and args.conversation_output.resolve() in protected:
             parser.error('Conversation output must differ from tasks, rules, and index')
+        if args.conversation_output and args.conversation_output.resolve() == args.output.resolve():
+            parser.error('Conversation output must differ from result output')
         summary = run_benchmark(args.tasks, args.output,
                       conversation_output=args.conversation_output,
-                      rules_dir=args.rules_dir, index_dir=args.index_dir,
-                      workspace_root=args.workspace_root, dsh_home=args.dsh_home,
+                      final_dir=args.final_dir, workspace_root=args.workspace_root,
                       base_url=args.base_url, model=args.model,
                       api_key=os.getenv(args.api_key_env, 'dummy'),
                       max_steps=args.max_steps, max_tokens=args.max_tokens,
-                      context_window=args.context_window,
                       embedding_base_url=args.embedding_base_url,
-                      embedding_api_key_env=args.embedding_api_key_env,
-                      dsh_bin=args.dsh_bin, memory_sessions=args.memory_sessions,
-                      debug=args.debug, startup_timeout_seconds=args.startup_timeout)
+                      embedding_api_key=os.getenv(args.embedding_api_key_env, 'dummy'),
+                      request_timeout=args.request_timeout, debug=args.debug)
         return 1 if any(summary['statuses'].get(status, 0) for status in
-                        ('runtime_error', 'error', 'no_finish_reason')) else 0
+                        ('llm_error', 'runtime_error', 'error', 'no_finish_reason')) else 0
 
     if args.command == 'demo':
         if not args.documents.is_file() or not args.parts.is_file() or not args.tasks.is_file():
