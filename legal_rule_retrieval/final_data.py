@@ -1,5 +1,6 @@
 """Prepare the final Neo4j parts export and score article-level citations."""
 
+import hashlib
 import json
 import re
 import unicodedata
@@ -93,21 +94,33 @@ class FinalRuleDatabase:
         self.source = self.path.open('rb')
         try:
             self.manifest = json.loads((directory / 'manifest.json').read_text(encoding='utf-8'))
-            if self.manifest.get('version') != 2 or self.manifest['rules_sha256'] != file_sha256(self.path):
+            if self.manifest.get('version') != 2:
                 raise ValueError('Final corpus changed or has an unsupported manifest')
-            self.index = faiss.read_index(str(directory / 'index.faiss'))
+            expected_hash = self.manifest['rules_sha256']
             self.offsets, self.id_to_row = [], {}
-            while line := self.source.readline():
-                offset = self.source.tell() - len(line)
-                row = json.loads(line)
-                identifier = row['identifier']
-                if identifier in self.id_to_row:
-                    raise ValueError('Duplicate identifier: ' + identifier)
-                self.id_to_row[identifier] = len(self.offsets)
-                self.offsets.append(offset)
-            if len(self.offsets) != self.index.ntotal or self.index.d != self.manifest['dimension']:
+            digest = hashlib.sha256()
+            print(f'Loading {self.manifest["rules"]} legal parts from {self.path}...', flush=True)
+            with tqdm(total=self.manifest['rules'], desc='Loading legal parts', unit='part') as progress:
+                while line := self.source.readline():
+                    digest.update(line)
+                    offset = self.source.tell() - len(line)
+                    row = json.loads(line)
+                    identifier = row['identifier']
+                    if identifier in self.id_to_row:
+                        raise ValueError('Duplicate identifier: ' + identifier)
+                    self.id_to_row[identifier] = len(self.offsets)
+                    self.offsets.append(offset)
+                    progress.update(1)
+            if digest.hexdigest() != expected_hash:
+                raise ValueError('Final corpus changed or has an unsupported manifest')
+            print('Loading FAISS index...', flush=True)
+            self.index = faiss.read_index(str(directory / 'index.faiss'))
+            if (len(self.offsets) != self.manifest['rules'] or
+                    len(self.offsets) != self.index.ntotal or
+                    self.index.d != self.manifest['dimension']):
                 raise ValueError('Final corpus and vector index do not align')
             self.embedder = embedder
+            print(f'Loaded {len(self.offsets)} legal parts with {self.index.d}-dimensional embeddings.')
         except Exception:
             self.source.close()
             raise

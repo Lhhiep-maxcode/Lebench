@@ -80,8 +80,8 @@ class DirectRunnerTests(unittest.TestCase):
                       'laws': [{'year': 2020, 'provisions': [
                           {'citation_str': 'Điều 5 Bộ luật Lao động 2020'}]}]}
             log = io.StringIO()
-            with FinalRuleDatabase(prepared, HashEmbedder()) as database, \
-                    contextlib.redirect_stderr(log):
+            with contextlib.redirect_stderr(log), \
+                    FinalRuleDatabase(prepared, HashEmbedder()) as database:
                 result = run_task(sample, database, ScriptedClient(rule['identifier']),
                                   workspace_root=root / 'work', debug=True, verbosity=2)
             self.assertEqual(result['status'], 'submitted')
@@ -109,6 +109,14 @@ class DirectRunnerTests(unittest.TestCase):
             self.assertEqual(events[8]['observation']['precision'], 1.0)
             self.assertEqual(events[-1]['status'], 'submitted')
             self.assertTrue(all(event['timestamp'].endswith('+00:00') for event in events))
+            self.assertIn('Loading legal parts', log.getvalue())
+
+            rules_path = prepared / 'rules.jsonl'
+            changed = json.loads(rules_path.read_text(encoding='utf-8'))
+            changed['content'] += ' changed'
+            rules_path.write_text(json.dumps(changed, ensure_ascii=False) + '\n', encoding='utf-8')
+            with self.assertRaisesRegex(ValueError, 'Final corpus changed'):
+                FinalRuleDatabase(prepared, HashEmbedder())
 
 
 if __name__ == '__main__':
