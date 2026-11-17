@@ -6,6 +6,7 @@ It does not import the DeepSeek Harness SDK or start a separate MCP process.
 
 import json
 import sys
+import time
 import traceback
 import urllib.error
 import urllib.request
@@ -132,6 +133,10 @@ def run_task(sample, database, client, *, max_steps=24, workspace_root='output/r
         raise ValueError('Task requires a nonempty issues list')
     gold_citations(laws)  # Validate gold without adding it to model-visible messages.
     task_id = str(sample.get('id') or sample.get('doc_name') or 'task')
+    def log(message):
+        if debug:
+            print(f'[{task_id}] {message}', file=sys.stderr, flush=True)
+
     session = ToolSession(database, workspace_root, task_id + '-' + uuid.uuid4().hex)
     messages = [
         {'role': 'system', 'content': SYSTEM_PROMPT, 'reasoning_content': ''},
@@ -139,16 +144,22 @@ def run_task(sample, database, client, *, max_steps=24, workspace_root='output/r
                                              ensure_ascii=False), 'reasoning_content': ''},
     ]
     trace, status, error = [], 'max_steps', None
+    log(f'start; max_steps={max_steps}')
     for step in range(1, max_steps + 1):
+        log(f'step {step}: sending chat request')
+        started = time.monotonic()
         try:
             assistant = _assistant_message(client.complete(messages))
         except Exception as exc:
             status, error = 'llm_error', f'{type(exc).__name__}: {exc}'
+            log(f'step {step}: chat request failed after {time.monotonic() - started:.1f}s')
             if debug:
                 error += '\n' + traceback.format_exc()
             break
         messages.append(assistant)
         calls = assistant.get('tool_calls') or []
+        log(f'step {step}: chat response after {time.monotonic() - started:.1f}s; '
+            f'{len(calls)} tool call(s)')
         if not calls:
             status = 'no_tool_calls'
             break
@@ -159,6 +170,8 @@ def run_task(sample, database, client, *, max_steps=24, workspace_root='output/r
             raw_arguments = function.get('arguments', '{}')
             trace_item = {'step': step, 'call_id': call_id, 'action': name,
                           'tool_called': True}
+            log(f'step {step}: tool {name} started')
+            tool_started = time.monotonic()
             try:
                 if name not in TOOL_NAMES:
                     raise ValueError(f'Unknown tool: {name}')
@@ -179,11 +192,23 @@ def run_task(sample, database, client, *, max_steps=24, workspace_root='output/r
                 observation = {'error': f'{type(exc).__name__}: {exc}'}
             trace_item['observation'] = observation
             trace.append(trace_item)
+            if 'error' in observation:
+                outcome = 'error'
+            elif name == 'search_legal_rules':
+                outcome = f"{len(observation.get('results', []))} result(s)"
+            elif name == 'submit':
+                outcome = (f"precision={observation['precision']:.3f}, "
+                           f"recall={observation['recall']:.3f}")
+            else:
+                outcome = 'ok'
+            log(f'step {step}: tool {name} finished after '
+                f'{time.monotonic() - tool_started:.1f}s; {outcome}')
             messages.append({'role': 'tool', 'tool_call_id': call_id,
                              'content': json.dumps(observation, ensure_ascii=False),
                              'reasoning_content': ''})
         if status == 'submitted':
             break
+    log(f'finished: {status}; {len(trace)} tool call(s)')
     selected = session.submitted or []
     score = score_submission(selected, laws, database)
     metrics = evaluate(selected, None, trace)

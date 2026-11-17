@@ -1,6 +1,8 @@
 """Direct Python legal tool loop without DeepSeek SDK or MCP startup."""
 
 import json
+import io
+import contextlib
 import tempfile
 import threading
 import unittest
@@ -77,9 +79,11 @@ class DirectRunnerTests(unittest.TestCase):
                       'issues': ['Quyền của người lao động'],
                       'laws': [{'year': 2020, 'provisions': [
                           {'citation_str': 'Điều 5 Bộ luật Lao động 2020'}]}]}
-            with FinalRuleDatabase(prepared, HashEmbedder()) as database:
+            log = io.StringIO()
+            with FinalRuleDatabase(prepared, HashEmbedder()) as database, \
+                    contextlib.redirect_stderr(log):
                 result = run_task(sample, database, ScriptedClient(rule['identifier']),
-                                  workspace_root=root / 'work')
+                                  workspace_root=root / 'work', debug=True)
             self.assertEqual(result['status'], 'submitted')
             self.assertEqual(result['metrics']['precision'], 1.0)
             self.assertEqual(result['metrics']['recall'], 1.0)
@@ -91,6 +95,8 @@ class DirectRunnerTests(unittest.TestCase):
                              ['system', 'user', 'assistant', 'tool', 'assistant', 'tool'])
             self.assertTrue(all('reasoning_content' in message for message in conversation['messages']))
             self.assertNotIn('laws', conversation['messages'][1]['content'])
+            self.assertIn('step 1: sending chat request', log.getvalue())
+            self.assertIn('tool submit finished', log.getvalue())
 
 
 if __name__ == '__main__':

@@ -84,7 +84,8 @@ def main(argv=None):
     dsh.add_argument('--request-timeout', '--startup-timeout', dest='request_timeout',
                      type=int, default=600,
                      help='Seconds to wait for each chat/embedding HTTP response; --startup-timeout is an alias')
-    dsh.add_argument('--debug', action='store_true', help='Print and save runtime exception tracebacks')
+    dsh.add_argument('--debug', action='store_true',
+                     help='Print live per-step/tool progress and exception tracebacks')
 
     demo = commands.add_parser('demo', help='Offline end-to-end demo with hash vectors (not real embeddings)')
     demo.add_argument('--documents', type=Path, default=ROOT / 'src_data' / 'neo4j_documents_sample.jsonl')
