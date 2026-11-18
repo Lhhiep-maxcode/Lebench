@@ -8,8 +8,6 @@ from pathlib import Path
 from .corpus import prepare, rows
 from .files import private_text_output
 from .harness import DemoClient, OpenAICompatibleClient, aggregate, run_task
-from .vectors import VectorRuleDatabase, build_vectors, make_embedder
-from .final_data import prepare_final
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -70,6 +68,8 @@ def main(argv=None):
     dsh.add_argument('--final-dir', type=Path, help='Single-file final corpus prepared by prepare-final')
     dsh.add_argument('--max-rules', type=int,
                      help='Debug: load only the first N legal parts into a temporary search index')
+    dsh.add_argument('--search-threads', type=int, default=1,
+                     help='Native FAISS/BLAS threads for search (default: 1; use a small value)')
     dsh.add_argument('--tasks', type=Path, required=True)
     dsh.add_argument('--output', type=Path, default=ROOT / 'output' / 'rule_retrieval_dsh.jsonl')
     dsh.add_argument('--conversation-output', type=Path,
@@ -97,6 +97,17 @@ def main(argv=None):
     demo.add_argument('--tasks', type=Path, default=DEFAULT_TASKS)
     demo.add_argument('--output-dir', type=Path, default=ROOT / 'output' / 'legal_rule_demo')
     args = parser.parse_args(argv)
+
+    # Set native thread counts before importing NumPy/FAISS. Large CPU allocations
+    # can make OpenBLAS abort when the legal index is searched for the first time.
+    if args.command in ('run-python', 'run-dsh'):
+        if not 1 <= args.search_threads <= 8:
+            parser.error('--search-threads must be between 1 and 8')
+        for name in ('OPENBLAS_NUM_THREADS', 'OMP_NUM_THREADS', 'MKL_NUM_THREADS'):
+            os.environ[name] = str(args.search_threads)
+
+    from .vectors import VectorRuleDatabase, build_vectors, make_embedder
+    from .final_data import prepare_final
 
     if args.command == 'prepare':
         if not args.documents.is_file() or not args.parts.is_file():
@@ -175,7 +186,8 @@ def main(argv=None):
                       embedding_base_url=args.embedding_base_url,
                       embedding_api_key=os.getenv(args.embedding_api_key_env, 'dummy'),
                       request_timeout=args.request_timeout, debug=args.debug,
-                      verbosity=args.verbosity, max_rules=args.max_rules)
+                      verbosity=args.verbosity, max_rules=args.max_rules,
+                      search_threads=args.search_threads)
         return 1 if any(summary['statuses'].get(status, 0) for status in
                         ('llm_error', 'runtime_error', 'error', 'no_finish_reason')) else 0
 

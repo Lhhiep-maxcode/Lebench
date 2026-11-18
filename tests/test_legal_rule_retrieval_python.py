@@ -11,7 +11,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from legal_rule_retrieval.final_data import FinalRuleDatabase, prepare_final
-from legal_rule_retrieval.python_runner import ChatClient, TOOLS, run_task
+from legal_rule_retrieval.python_runner import ChatClient, TOOLS, run_benchmark, run_task
 from legal_rule_retrieval.vectors import HashEmbedder
 
 
@@ -19,6 +19,7 @@ class ScriptedClient:
     def __init__(self, rule_id):
         self.rule_id = rule_id
         self.calls = 0
+        self.url = 'http://localhost/v1/chat/completions'
 
     def complete(self, messages):
         self.calls += 1
@@ -49,10 +50,33 @@ class DirectRunnerTests(unittest.TestCase):
                     self.assertEqual(database.index.ntotal, 2)
                     self.assertLess(database.source.tell(), (prepared / 'rules.jsonl').stat().st_size)
                     self.assertIsNone(database.get('Rule 2'))
-                    self.assertEqual({hit['rule_id'] for hit in database.search('Law 1', top_k=3)},
-                                     {'Rule 0', 'Rule 1'})
+                    with patch('legal_rule_retrieval.final_data.np.linalg.norm',
+                               side_effect=AssertionError('single-query search must avoid BLAS')):
+                        self.assertEqual({hit['rule_id'] for hit in database.search('Law 1', top_k=3)},
+                                         {'Rule 0', 'Rule 1'})
             with self.assertRaisesRegex(ValueError, 'max_rules must be a positive integer'):
                 FinalRuleDatabase(prepared, HashEmbedder(), max_rules=0)
+
+    def test_benchmark_caps_faiss_threads(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            rules = [{'identifier': f'Rule {i}', 'title': f'Law {i}', 'content': 'Text'}
+                     for i in range(2)]
+            source = root / 'parts.jsonl'
+            source.write_text(''.join(json.dumps(row) + '\n' for row in rules), encoding='utf-8')
+            prepared = root / 'prepared'
+            prepare_final(source, prepared, HashEmbedder(), 'hash')
+            tasks = root / 'tasks.jsonl'
+            tasks.write_text(json.dumps({'id': 'case', 'benchmark_seed': {'facts_clean': 'Facts'},
+                                         'issues': ['Issue'], 'laws': []}) + '\n', encoding='utf-8')
+            with patch('legal_rule_retrieval.python_runner.ChatClient',
+                       return_value=ScriptedClient('Rule 0')), \
+                    patch('legal_rule_retrieval.python_runner.faiss.omp_set_num_threads') as set_threads:
+                summary = run_benchmark(tasks, root / 'results.jsonl', final_dir=prepared,
+                                        workspace_root=root / 'work', base_url='http://localhost/v1',
+                                        model='mock', max_rules=1, search_threads=1)
+            set_threads.assert_called_once_with(1)
+            self.assertEqual(summary['statuses']['submitted'], 1)
 
     def test_chat_client_sends_native_tool_schemas(self):
         received = []

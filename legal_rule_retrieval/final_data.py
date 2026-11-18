@@ -183,7 +183,7 @@ class FinalRuleDatabase:
         if type(top_k) is not int or not 1 <= top_k <= 20:
             raise ValueError('top_k must be between 1 and 20')
         vector = np.asarray(self.embedder.embed([query]), dtype=np.float32)
-        if vector.shape != (1, self.index.d) or not np.isfinite(vector).all() or np.linalg.norm(vector) == 0:
+        if vector.shape != (1, self.index.d) or not np.isfinite(vector).all() or not np.any(vector):
             raise ValueError('Invalid query embedding')
         faiss.normalize_L2(vector)
         scores, positions = self.index.search(np.ascontiguousarray(vector), min(top_k, self.index.ntotal))

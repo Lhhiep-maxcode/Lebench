@@ -15,6 +15,8 @@ from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 
+import faiss
+
 from .corpus import rows
 from .files import private_text_output
 from .final_data import FinalRuleDatabase, gold_citations, score_submission
@@ -257,7 +259,10 @@ def run_benchmark(tasks, output, *, final_dir, workspace_root, base_url, model,
                   api_key='dummy', embedding_base_url=None,
                   embedding_api_key='dummy', max_steps=24, max_tokens=4096,
                   request_timeout=600, conversation_output=None, debug=False, verbosity=0,
-                  max_rules=None):
+                  max_rules=None, search_threads=1):
+    if not 1 <= search_threads <= 8:
+        raise ValueError('search_threads must be between 1 and 8')
+    faiss.omp_set_num_threads(search_threads)
     final_dir, tasks, output = Path(final_dir), Path(tasks), Path(output)
     manifest = json.loads((final_dir / 'manifest.json').read_text(encoding='utf-8'))
     if manifest.get('version') != 2:
@@ -265,6 +270,9 @@ def run_benchmark(tasks, output, *, final_dir, workspace_root, base_url, model,
     embedder = make_embedder(manifest['backend'], manifest['embedding_model'],
                              embedding_base_url, embedding_api_key, request_timeout)
     client = ChatClient(base_url, model, api_key, request_timeout, max_tokens)
+    full_index_gib = manifest['rules'] * manifest['dimension'] * 4 / (1024 ** 3)
+    print(f'FAISS/OpenBLAS search threads: {search_threads}; full float32 index: '
+          f'about {full_index_gib:.1f} GiB', file=sys.stderr, flush=True)
     print(f'Chat endpoint: {client.url} (model={model})', file=sys.stderr, flush=True)
     embedding_endpoint = getattr(embedder, 'url', None)
     if embedding_endpoint:
