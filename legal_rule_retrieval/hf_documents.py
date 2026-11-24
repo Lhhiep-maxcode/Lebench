@@ -64,6 +64,21 @@ def _rows_in_shard(path):
             yield json.loads(line)
 
 
+def _embedding_title(row):
+    """Use the title when present; preserve the source row when it is missing."""
+    title = row.get('title')
+    if isinstance(title, str) and title.strip():
+        return title.strip()
+    metadata = [row[key].strip() for key in ('loai_van_ban', 'so_ky_hieu')
+                if isinstance(row.get(key), str) and row[key].strip()]
+    if metadata:
+        return ' '.join(metadata)
+    content = row.get('full_content')
+    if isinstance(content, str) and content.strip():
+        return ' '.join(content.split())[:250]
+    return f"Văn bản pháp luật {row['id']}"
+
+
 def prepare_document_rows(dataset, output_dir, embedder, *, source_repo,
                           source_revision, split='train', embedding_model,
                           batch_size=8, shard_rows=1000, vector_dim=4096,
@@ -148,7 +163,8 @@ def prepare_document_rows(dataset, output_dir, embedder, *, source_repo,
         nonlocal shard_stream, temporary_path, shard_count, total
         if not pending:
             return
-        vectors = np.asarray(embedder.embed(['passage: ' + row['title'] for row in pending]),
+        vectors = np.asarray(embedder.embed(['passage: ' + _embedding_title(row)
+                                             for row in pending]),
                              dtype=np.float32)
         if vectors.ndim != 2 or vectors.shape[0] != len(pending) or vectors.shape[1] < vector_dim:
             raise ValueError('Embedding response has an invalid shape')
@@ -175,9 +191,8 @@ def prepare_document_rows(dataset, output_dir, embedder, *, source_repo,
                     break
                 if not isinstance(row, dict):
                     raise ValueError('Each dataset row must be an object')
-                if (not isinstance(row.get('id'), (str, int)) or
-                        not isinstance(row.get('title'), str) or not row['title'].strip()):
-                    raise ValueError('Each row needs an id and a nonempty title')
+                if not isinstance(row.get('id'), (str, int)) or not str(row['id']).strip():
+                    raise ValueError('Each row needs a nonempty id')
                 if 'emb_vector' in row:
                     raise ValueError('Source row already contains emb_vector')
                 identifier = str(row['id'])
@@ -208,7 +223,7 @@ def build_document_index(output_dir, config, expected_rows):
     index = faiss.IndexFlatIP(config['dimension'])
     index_tmp = output_dir / 'index.faiss.tmp'
     id_tmp = output_dir / 'id_map.jsonl.tmp'
-    count = 0
+    count, fallback_title_rows = 0, 0
 
     with id_tmp.open('w', encoding='utf-8') as ids, \
             tqdm(total=expected_rows, desc='Building FAISS index', unit='doc') as progress:
@@ -220,8 +235,10 @@ def build_document_index(output_dir, config, expected_rows):
                                            dtype=np.float32))
             shard_count = 0
             for row in _rows_in_shard(path):
-                ids.write(json.dumps({'id': row['id'], 'title': row['title']},
+                ids.write(json.dumps({'id': row['id'], 'title': row.get('title')},
                                      ensure_ascii=False) + '\n')
+                if not isinstance(row.get('title'), str) or not row['title'].strip():
+                    fallback_title_rows += 1
                 count += 1
                 shard_count += 1
                 progress.update(1)
@@ -233,6 +250,7 @@ def build_document_index(output_dir, config, expected_rows):
     index_tmp.replace(output_dir / 'index.faiss')
     id_tmp.replace(output_dir / 'id_map.jsonl')
     manifest = {'version': 4, **config, 'rows': count,
+                'fallback_title_rows': fallback_title_rows,
                 'index_file': 'index.faiss', 'id_map_file': 'id_map.jsonl',
                 'index_sha256': file_sha256(output_dir / 'index.faiss')}
     card = ('---\nconfigs:\n- config_name: default\n  data_files:\n'

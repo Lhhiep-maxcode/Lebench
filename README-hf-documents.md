@@ -1,6 +1,6 @@
 # Prepare title embeddings for the Vietnamese legal corpus
 
-This workflow reads `Hiepppp/vietnamese-legal-corpus` from Hugging Face, embeds **only** each document's `title`, and writes a new dataset. Each output row retains the original fields (`id`, `full_content`, dates, `relationships`, etc.) with **no embedding array in JSONL**. The vectors are stored in `index.faiss` only. `id_map.jsonl` connects FAISS positions to source document IDs.
+This workflow reads `Hiepppp/vietnamese-legal-corpus` from Hugging Face, embeds each document's `title`, and writes a new dataset. If a title is empty, it embeds `loai_van_ban` and `so_ky_hieu` when available, otherwise a short `full_content` excerpt or the document ID. The output row keeps the original title and all other source fields unchanged, with **no embedding array in JSONL**. The vectors are stored in `index.faiss` only. `id_map.jsonl` connects FAISS positions to source document IDs. `manifest.json` reports the number of rows that used a title fallback as `fallback_title_rows`.
 
 ## 1. Install and serve the embedding model
 
@@ -83,6 +83,8 @@ python3 -u -m legal_rule_retrieval prepare-hf-documents \
 ```
 
 The command resolves the source repository to a fixed commit and streams its `train` split. Each completed JSONL shard is paired with a temporary FAISS checkpoint. If a run is interrupted, rerun the **same command** and output directory: completed pairs are reused and only unfinished documents are embedded again. Once complete, the checkpoints are merged into `index.faiss` and removed. During the merge, FAISS checkpoints and the final index temporarily coexist on disk; the uploaded dataset contains only the final index. The preparation settings, including source revision, embedding model, dimension, and `--max-rows`, must be identical on resume. If the source repository changes between runs, pass its original commit SHA with `--revision` or start a new output directory.
+
+For example, if preparation stops after 6,144 documents with `--shard-rows 1000`, rerunning keeps the first 6 completed shards (6,000 documents) and reprocesses the unfinished 144 documents before continuing. Upload starts only after preparation completes; if upload alone fails, the same command reuses the finished local index and retries upload.
 
 The destination repository receives `data/train-*.jsonl.gz`, `index.faiss`, `id_map.jsonl`, `manifest.json`, and `README.md`. The generated dataset card tells `datasets.load_dataset` to read only the JSONL shards. For example:
 

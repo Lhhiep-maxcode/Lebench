@@ -30,6 +30,29 @@ class FakeEmbedder:
 
 
 class HuggingFaceDocumentTests(unittest.TestCase):
+    def test_missing_title_uses_metadata_and_resumes(self):
+        rows = [
+            {'id': '0', 'title': 'Luật mẫu'},
+            {'id': '1', 'title': 'Nghị định mẫu'},
+            {'id': '2', 'title': None, 'loai_van_ban': 'Nghị quyết',
+             'so_ky_hieu': '223/2019/NQ-HĐND', 'full_content': 'Nội dung'},
+        ]
+        options = {'source_repo': 'example/legal', 'source_revision': 'abc123',
+                   'embedding_model': 'model', 'batch_size': 1,
+                   'shard_rows': 2, 'vector_dim': 2}
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp)
+            with self.assertRaisesRegex(RuntimeError, 'interrupted embedding'):
+                prepare_document_rows(rows, output, FakeEmbedder(fail_after=2), **options)
+            resumed = FakeEmbedder()
+            manifest = prepare_document_rows(rows, output, resumed, **options)
+            self.assertEqual(resumed.calls, [['passage: Nghị quyết 223/2019/NQ-HĐND']])
+            self.assertEqual(manifest['rows'], 3)
+            self.assertEqual(manifest['fallback_title_rows'], 1)
+            with gzip.open(output / 'data' / 'train-00001.jsonl.gz', 'rt',
+                           encoding='utf-8') as stream:
+                self.assertEqual(json.loads(stream.readline()), rows[2])
+
     def test_resume_preserves_fields_and_aligns_index(self):
         rows = [
             {'id': str(i), 'title': f'Luật số {i}', 'so_ky_hieu': f'{i}/2020/QH',
