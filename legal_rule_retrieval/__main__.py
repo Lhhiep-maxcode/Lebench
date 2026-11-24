@@ -32,6 +32,36 @@ def main(argv=None):
     final.add_argument('--batch-size', type=int, default=32)
     final.add_argument('--timeout', type=float, default=120)
 
+    hf_docs = commands.add_parser('prepare-hf-documents',
+                                  help='Embed document titles from a Hugging Face dataset')
+    hf_docs.add_argument('--source-repo', default='Hiepppp/vietnamese-legal-corpus')
+    hf_docs.add_argument('--revision', help='Optional source revision; resolved to a commit SHA')
+    hf_docs.add_argument('--split', default='train')
+    hf_docs.add_argument('--output-dir', type=Path, default=ROOT / 'output' / 'hf_legal_documents')
+    hf_docs.add_argument('--embedding-base-url', required=True,
+                         help='OpenAI-compatible vLLM URL ending in /v1')
+    hf_docs.add_argument('--embedding-model', default='nvidia/Nemotron-3-Embed-8B-BF16')
+    hf_docs.add_argument('--embedding-api-key-env', default='EMBEDDING_API_KEY')
+    hf_docs.add_argument('--hf-token-env', default='HF_TOKEN')
+    hf_docs.add_argument('--batch-size', type=int, default=8)
+    hf_docs.add_argument('--shard-rows', type=int, default=1000)
+    hf_docs.add_argument('--vector-dim', type=int, default=4096,
+                         help='Keep the first N embedding dimensions and normalize again')
+    hf_docs.add_argument('--max-rows', type=int, help='Local smoke test; cannot be uploaded')
+    hf_docs.add_argument('--timeout', type=float, default=120)
+    hf_docs.add_argument('--upload', action='store_true', help='Upload completed data and FAISS files')
+    hf_docs.add_argument('--repo-id', help='Destination Hugging Face dataset repo for --upload')
+    hf_docs.add_argument('--private', action='store_true')
+
+    hf_search = commands.add_parser('search-hf-documents',
+                                    help='Search a prepared HF document-title FAISS index')
+    hf_search.add_argument('--prepared-dir', type=Path, required=True)
+    hf_search.add_argument('--embedding-base-url', required=True)
+    hf_search.add_argument('--embedding-api-key-env', default='EMBEDDING_API_KEY')
+    hf_search.add_argument('--query', required=True)
+    hf_search.add_argument('--top-k', type=int, default=5)
+    hf_search.add_argument('--timeout', type=float, default=120)
+
     embed = commands.add_parser('embed', help='Embed prepared provision chunks and build FAISS index')
     embed.add_argument('--rules-dir', type=Path, default=ROOT / 'output' / 'legal_rule_corpus')
     embed.add_argument('--index-dir', type=Path, default=ROOT / 'output' / 'legal_rule_index')
@@ -130,6 +160,46 @@ def main(argv=None):
             parser.error(str(exc))
         print('Prepared final corpus:', args.output_dir / 'rules.jsonl')
         print('Manifest:', json.dumps(manifest, ensure_ascii=False))
+        return 0
+
+    if args.command == 'prepare-hf-documents':
+        from datasets import load_dataset
+        from huggingface_hub import HfApi
+        from .hf_documents import prepare_document_rows, upload_document_corpus
+
+        if args.upload and (not args.repo_id or args.max_rows is not None):
+            parser.error('--upload requires --repo-id and cannot be combined with --max-rows')
+        if min(args.batch_size, args.shard_rows, args.vector_dim) < 1:
+            parser.error('--batch-size, --shard-rows, and --vector-dim must be positive')
+        token = os.getenv(args.hf_token_env)
+        revision = HfApi(token=token).dataset_info(args.source_repo,
+                                                  revision=args.revision).sha
+        dataset = load_dataset(args.source_repo, split=args.split, revision=revision,
+                               streaming=True, token=token)
+        embedder = make_embedder('api', args.embedding_model, args.embedding_base_url,
+                                 os.getenv(args.embedding_api_key_env, 'dummy'), args.timeout)
+        manifest = prepare_document_rows(
+            dataset, args.output_dir, embedder, source_repo=args.source_repo,
+            source_revision=revision, split=args.split,
+            embedding_model=args.embedding_model, batch_size=args.batch_size,
+            shard_rows=args.shard_rows, vector_dim=args.vector_dim,
+            max_rows=args.max_rows)
+        print('Prepared:', json.dumps(manifest, ensure_ascii=False))
+        if args.upload:
+            result = upload_document_corpus(args.output_dir, args.repo_id,
+                                            token=token, private=args.private)
+            print('Uploaded:', result)
+        return 0
+
+    if args.command == 'search-hf-documents':
+        from .hf_documents import search_document_index
+
+        manifest = json.loads((args.prepared_dir / 'manifest.json').read_text(encoding='utf-8'))
+        embedder = make_embedder('api', manifest['embedding_model'],
+                                 args.embedding_base_url,
+                                 os.getenv(args.embedding_api_key_env, 'dummy'), args.timeout)
+        print(json.dumps(search_document_index(args.prepared_dir, embedder,
+                                               args.query, args.top_k), ensure_ascii=False, indent=2))
         return 0
 
     if args.command == 'embed':

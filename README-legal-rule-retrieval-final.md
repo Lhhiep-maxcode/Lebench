@@ -1,5 +1,7 @@
 # Legal rule retrieval with the final Neo4j parts export
 
+For the newer Hugging Face **document-level** corpus, see [README-hf-documents.md](README-hf-documents.md). The workflow below remains for provision-level benchmark records.
+
 This is the single-file workflow. It keeps the previous two-file workflow available for older benchmarks.
 
 ## Prepare the corpus
