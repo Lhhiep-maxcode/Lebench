@@ -48,7 +48,9 @@ python3 -u -m legal_rule_retrieval run-dsh \
 the two paths above, so those flags may be omitted. The benchmark requires no
 Hugging Face connection after the snapshot is downloaded. It loads the FAISS
 index once and sends only `sample["input"]` to the model; `expected_answer` is
-kept private for scoring.
+kept private for scoring. The system prompt loads
+`legal_rule_retrieval/skills/skill_rule_recall.md` once per process, followed
+by the harness-specific citation and tool-use requirements.
 
 The tool descriptions are defined once in `TOOL_SPECS` in
 `legal_rule_retrieval/harness.py`. `python_runner.py` converts them to native
@@ -82,7 +84,11 @@ Points and clauses are collapsed to their parent article. Duplicate article
 citations count once. Gold entries missing an article, document, or year are
 ignored; if a task has no complete gold citations, it is marked unscored.
 Invalid submitted citations count as false positives. Results report precision,
-recall, F1, and tool-call counts.
+recall, F1, and tool-call counts. Each result JSONL row also includes the raw
+`expected_answer`, plus `correct_answers` and `incorrect_answers` containing
+submitted citations classified against the usable gold citations. Equivalent
+citations are shown once in those two lists, matching the scoring counts. These
+fields are saved after the interaction and are never sent to the model.
 
 The benchmark runs entirely through this repository's Python tool loop; it
 does not install the DeepSeek Harness SDK or require its MCP runtime.

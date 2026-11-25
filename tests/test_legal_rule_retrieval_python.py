@@ -75,6 +75,12 @@ class DirectRunnerTests(unittest.TestCase):
             set_threads.assert_called_once_with(1)
             self.assertEqual(summary['statuses']['submitted'], 1)
             self.assertEqual(summary['micro_f1'], 1.0)
+            result = json.loads((root / 'results.jsonl').read_text(encoding='utf-8').strip())
+            self.assertEqual(result['expected_answer'], [
+                'Điều 114 Luật Tố tụng hành chính 2010'])
+            self.assertEqual(result['correct_answers'], [
+                'Điều 114 Luật Tố tụng hành chính 2010'])
+            self.assertEqual(result['incorrect_answers'], [])
 
 
 if __name__ == '__main__':

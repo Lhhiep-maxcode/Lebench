@@ -173,6 +173,8 @@ class HFBenchmarkTests(unittest.TestCase):
                           score['gold_count'], score['ignored_expected_count']), (2, 3, 2, 1))
         self.assertAlmostEqual(score['precision'], 2 / 3)
         self.assertEqual(score['recall'], 1.0)
+        self.assertEqual(score['correct_answers'], [predicted[0], predicted[2]])
+        self.assertEqual(score['incorrect_answers'], [predicted[3]])
         self.assertIsNone(citation_key('Nghị quyết 326/2016/UBTVQH14'))
         self.assertIsNone(citation_key('Điều 114 Luật Tố tụng hành chính'))
         self.assertIsNone(citation_key('Điều 114 2010'))
@@ -193,7 +195,17 @@ class HFBenchmarkTests(unittest.TestCase):
             self.assertEqual(result['status'], 'submitted')
             self.assertEqual(result['metrics']['true_positives'], 1)
             self.assertEqual(result['metrics']['gold_count'], 2)
+            self.assertEqual(result['expected_answer'], gold)
+            self.assertEqual(result['correct_answers'], [
+                'Điều 114 Luật Tố tụng hành chính 2010'])
+            self.assertEqual(result['incorrect_answers'], [])
             self.assertEqual(result['conversation']['tools'], TOOLS)
+            self.assertIn('# Rule Recall — Truy hồi căn cứ pháp luật Việt Nam',
+                          result['conversation']['messages'][0]['content'])
+            self.assertIn('## 7. Mô tả công cụ',
+                          result['conversation']['messages'][0]['content'])
+            self.assertIn('## Harness instructions',
+                          result['conversation']['messages'][0]['content'])
             self.assertEqual(result['conversation']['messages'][1]['content'], 'Find relevant law')
             self.assertNotIn('expected_answer', json.dumps(client.messages))
 

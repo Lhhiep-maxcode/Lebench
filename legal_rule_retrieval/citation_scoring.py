@@ -40,13 +40,20 @@ def score_submission(rule_ids, expected_answer):
     submitted = list(dict.fromkeys(x.strip() for x in rule_ids if x.strip()))
     gold = {key for item in expected_answer if (key := citation_key(item)) is not None}
     ignored = sum(citation_key(item) is None for item in expected_answer)
-    predicted = {citation_key(item) or ('invalid', item) for item in submitted}
-    correct = len(gold & predicted)
+    correct_answers, incorrect_answers, predicted = [], [], set()
+    for item in submitted:
+        key = citation_key(item) or ('invalid', item)
+        if key in predicted:
+            continue
+        predicted.add(key)
+        (correct_answers if key in gold else incorrect_answers).append(item)
+    correct = len(correct_answers)
     scored = bool(gold)
     precision = correct / len(predicted) if predicted else (1.0 if not gold else 0.0)
     recall = correct / len(gold) if gold else 1.0
     f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
     return {'submitted_rule_ids': submitted, 'scored': scored,
+            'correct_answers': correct_answers, 'incorrect_answers': incorrect_answers,
             'ignored_expected_count': ignored, 'true_positives': correct,
             'predicted_count': len(predicted), 'gold_count': len(gold),
             'precision': precision if scored else None,
