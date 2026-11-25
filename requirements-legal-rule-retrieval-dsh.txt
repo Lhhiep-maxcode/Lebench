@@ -1,2 +1,0 @@
--r requirements-legal-rule-retrieval.txt
-# run-dsh is now an alias for the direct Python runner; no SDK/runtime is installed.

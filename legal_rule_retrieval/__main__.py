@@ -1,321 +1,86 @@
-"""Prepare provisions, embed them, then run a legal-rule retrieval agent."""
+"""Run document-level legal retrieval against a downloaded Hugging Face corpus."""
 
 import argparse
-import json
 import os
 from pathlib import Path
 
-from .corpus import prepare, rows
-from .files import private_text_output
-from .harness import DemoClient, OpenAICompatibleClient, aggregate, run_task
-
 
 ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_TASKS = Path(__file__).resolve().parent / 'demo_tasks.jsonl'
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest='command', required=True)
-    prep = commands.add_parser('prepare', help='Convert raw document/part JSONL into provisions')
-    prep.add_argument('--documents', type=Path, required=True)
-    prep.add_argument('--parts', type=Path, required=True)
-    prep.add_argument('--output-dir', type=Path, default=ROOT / 'output' / 'legal_rule_corpus')
-
-    final = commands.add_parser('prepare-final', help='Embed titles in the final single-file legal corpus')
-    final.add_argument('--parts', type=Path, required=True)
-    final.add_argument('--output-dir', type=Path, required=True)
-    final.add_argument('--embedding-backend', choices=('api', 'local', 'hash'), default='api')
-    final.add_argument('--embedding-model', help='Embedding model name or local model directory')
-    final.add_argument('--embedding-base-url', help='OpenAI-compatible local embedding endpoint')
-    final.add_argument('--embedding-api-key-env', default='EMBEDDING_API_KEY')
-    final.add_argument('--batch-size', type=int, default=32)
-    final.add_argument('--timeout', type=float, default=120)
-
-    hf_docs = commands.add_parser('prepare-hf-documents',
-                                  help='Embed document titles from a Hugging Face dataset')
-    hf_docs.add_argument('--source-repo', default='Hiepppp/vietnamese-legal-corpus')
-    hf_docs.add_argument('--revision', help='Optional source revision; resolved to a commit SHA')
-    hf_docs.add_argument('--split', default='train')
-    hf_docs.add_argument('--output-dir', type=Path, default=ROOT / 'output' / 'hf_legal_documents')
-    hf_docs.add_argument('--embedding-base-url', required=True,
-                         help='OpenAI-compatible vLLM URL ending in /v1')
-    hf_docs.add_argument('--embedding-model', default='nvidia/Nemotron-3-Embed-8B-BF16')
-    hf_docs.add_argument('--embedding-api-key-env', default='EMBEDDING_API_KEY')
-    hf_docs.add_argument('--hf-token-env', default='HF_TOKEN')
-    hf_docs.add_argument('--batch-size', type=int, default=8)
-    hf_docs.add_argument('--shard-rows', type=int, default=1000)
-    hf_docs.add_argument('--vector-dim', type=int, default=4096,
-                         help='Keep the first N embedding dimensions and normalize again')
-    hf_docs.add_argument('--max-rows', type=int, help='Local smoke test; cannot be uploaded')
-    hf_docs.add_argument('--timeout', type=float, default=120)
-    hf_docs.add_argument('--upload', action='store_true', help='Upload completed data and FAISS files')
-    hf_docs.add_argument('--repo-id', help='Destination Hugging Face dataset repo for --upload')
-    hf_docs.add_argument('--private', action='store_true')
-
-    hf_search = commands.add_parser('search-hf-documents',
-                                    help='Search a prepared HF document-title FAISS index')
-    hf_search.add_argument('--prepared-dir', type=Path, required=True)
-    hf_search.add_argument('--embedding-base-url', required=True)
-    hf_search.add_argument('--embedding-api-key-env', default='EMBEDDING_API_KEY')
-    hf_search.add_argument('--query', required=True)
-    hf_search.add_argument('--top-k', type=int, default=5)
-    hf_search.add_argument('--timeout', type=float, default=120)
-
-    embed = commands.add_parser('embed', help='Embed prepared provision chunks and build FAISS index')
-    embed.add_argument('--rules-dir', type=Path, default=ROOT / 'output' / 'legal_rule_corpus')
-    embed.add_argument('--index-dir', type=Path, default=ROOT / 'output' / 'legal_rule_index')
-    embed.add_argument('--embedding-backend', choices=('api', 'local', 'hash'), default='api')
-    embed.add_argument('--embedding-model', help='Embedding model name or local sentence-transformers path')
-    embed.add_argument('--embedding-base-url', help='OpenAI-compatible embedding base URL ending in /v1')
-    embed.add_argument('--embedding-api-key-env', default='EMBEDDING_API_KEY')
-    embed.add_argument('--batch-size', type=int, default=32)
-    embed.add_argument('--chunk-chars', type=int, default=1800)
-    embed.add_argument('--overlap', type=int, default=200)
-    embed.add_argument('--passage-prefix', default='', help='Optional model-specific prefix for indexed passages')
-    embed.add_argument('--query-prefix', default='', help='Optional model-specific prefix for search queries')
-    embed.add_argument('--timeout', type=float, default=120)
-
-    run = commands.add_parser('run', help='Run benchmark tasks against the prepared vector index')
-    run.add_argument('--rules-dir', type=Path, default=ROOT / 'output' / 'legal_rule_corpus')
-    run.add_argument('--index-dir', type=Path, default=ROOT / 'output' / 'legal_rule_index')
-    run.add_argument('--tasks', type=Path, required=True)
-    run.add_argument('--output', type=Path, default=ROOT / 'output' / 'rule_retrieval_results.jsonl')
+    run = commands.add_parser('run-python', aliases=['run-dsh'],
+                              help='Run the document-level legal tool loop in Python')
+    run.add_argument('--corpus-dir', type=Path,
+                     default=ROOT / 'input' / 'vietnamese-legal-corpus')
+    run.add_argument('--tasks', type=Path, default=ROOT / 'input' / 'rule_recall.jsonl')
+    run.add_argument('--output', type=Path, default=ROOT / 'output' / 'rule_recall_results.jsonl')
+    run.add_argument('--conversation-output', type=Path)
     run.add_argument('--workspace-root', type=Path, default=ROOT / 'output' / 'rule_workspaces')
-    run.add_argument('--base-url', required=True, help='Chat model base URL ending in /v1')
-    run.add_argument('--model', required=True, help='Chat model name')
+    run.add_argument('--base-url', required=True, help='OpenAI-compatible chat API ending in /v1')
+    run.add_argument('--model', required=True)
     run.add_argument('--api-key-env', default='VLLM_API_KEY')
-    run.add_argument('--embedding-base-url', help='Embedding server base URL; required for API index')
+    run.add_argument('--embedding-base-url', required=True,
+                     help='OpenAI-compatible embedding API ending in /v1')
     run.add_argument('--embedding-api-key-env', default='EMBEDDING_API_KEY')
-    run.add_argument('--extra-body', default='{}', help='Additional JSON fields for chat requests')
-    run.add_argument('--timeout', type=float, default=120)
-    run.add_argument('--max-steps', type=int, default=8)
-
-    dsh = commands.add_parser('run-python', aliases=['run-dsh'],
-                              help='Run the legal tool loop directly in Python; run-dsh is an alias')
-    dsh.add_argument('--rules-dir', type=Path, default=ROOT / 'output' / 'legal_rule_corpus')
-    dsh.add_argument('--index-dir', type=Path, default=ROOT / 'output' / 'legal_rule_index')
-    dsh.add_argument('--final-dir', type=Path, help='Single-file final corpus prepared by prepare-final')
-    dsh.add_argument('--max-rules', type=int,
-                     help='Debug: load only the first N legal parts into a temporary search index')
-    dsh.add_argument('--search-threads', type=int, default=1,
-                     help='Native FAISS/BLAS threads for search (default: 1; use a small value)')
-    dsh.add_argument('--tasks', type=Path, required=True)
-    dsh.add_argument('--output', type=Path, default=ROOT / 'output' / 'rule_retrieval_dsh.jsonl')
-    dsh.add_argument('--conversation-output', type=Path,
-                     help='Optional OpenAI chat-template JSONL with messages, tools, and reasoning_content')
-    dsh.add_argument('--workspace-root', type=Path, default=ROOT / 'output' / 'rule_workspaces')
-    dsh.add_argument('--base-url', required=True, help='DeepSeek-compatible chat API base URL')
-    dsh.add_argument('--model', required=True)
-    dsh.add_argument('--api-key-env', default='VLLM_API_KEY')
-    dsh.add_argument('--embedding-base-url')
-    dsh.add_argument('--embedding-api-key-env', default='EMBEDDING_API_KEY')
-    dsh.add_argument('--max-steps', type=int, default=12)
-    dsh.add_argument('--max-tokens', type=int, default=4096)
-    dsh.add_argument('--context-window', type=int, default=131072)
-    dsh.add_argument('--request-timeout', '--startup-timeout', dest='request_timeout',
-                     type=int, default=600,
-                     help='Seconds to wait for each chat/embedding HTTP response; --startup-timeout is an alias')
-    dsh.add_argument('--debug', action='store_true',
-                     help='Print exception tracebacks and at least verbosity level 1')
-    dsh.add_argument('--verbosity', type=int, choices=(0, 1, 2), default=0,
-                     help='0: task results; 1: live step/tool progress; 2: include LLM text, tool arguments and observations')
-
-    demo = commands.add_parser('demo', help='Offline end-to-end demo with hash vectors (not real embeddings)')
-    demo.add_argument('--documents', type=Path, default=ROOT / 'src_data' / 'neo4j_documents_sample.jsonl')
-    demo.add_argument('--parts', type=Path, default=ROOT / 'src_data' / 'neo4j_parts_sample.jsonl')
-    demo.add_argument('--tasks', type=Path, default=DEFAULT_TASKS)
-    demo.add_argument('--output-dir', type=Path, default=ROOT / 'output' / 'legal_rule_demo')
+    run.add_argument('--search-threads', type=int, default=1)
+    run.add_argument('--max-steps', type=int, default=24)
+    run.add_argument('--max-tokens', type=int, default=4096)
+    run.add_argument('--context-window', type=int, default=131072)
+    run.add_argument('--request-timeout', '--startup-timeout', dest='request_timeout',
+                     type=int, default=600)
+    run.add_argument('--debug', action='store_true')
+    run.add_argument('--verbosity', type=int, choices=(0, 1, 2), default=0)
     args = parser.parse_args(argv)
 
-    # Set native thread counts before importing NumPy/FAISS. Large CPU allocations
-    # can make OpenBLAS abort when the legal index is searched for the first time.
-    if args.command in ('run-python', 'run-dsh'):
-        if not 1 <= args.search_threads <= 8:
-            parser.error('--search-threads must be between 1 and 8')
-        for name in ('OPENBLAS_NUM_THREADS', 'OMP_NUM_THREADS', 'MKL_NUM_THREADS'):
-            os.environ[name] = str(args.search_threads)
+    if not 1 <= args.search_threads <= 8:
+        parser.error('--search-threads must be between 1 and 8')
+    if args.max_steps < 1 or args.max_tokens < 1 or args.context_window < 4096:
+        parser.error('--max-steps and --max-tokens must be positive; --context-window >= 4096')
+    if args.max_tokens >= args.context_window:
+        parser.error('--max-tokens must be smaller than --context-window')
+    if not 1 <= args.request_timeout <= 3600:
+        parser.error('--request-timeout must be between 1 and 3600 seconds')
+    if not args.tasks.is_file():
+        parser.error(f'Tasks file missing: {args.tasks}')
 
-    from .vectors import VectorRuleDatabase, build_vectors, make_embedder
-    from .final_data import prepare_final
+    # Set native thread limits before importing FAISS/NumPy through the runner.
+    for name in ('OPENBLAS_NUM_THREADS', 'OMP_NUM_THREADS', 'MKL_NUM_THREADS'):
+        os.environ[name] = str(args.search_threads)
 
-    if args.command == 'prepare':
-        if not args.documents.is_file() or not args.parts.is_file():
-            parser.error('Raw document and part JSONL files must exist')
-        print(json.dumps(prepare(args.documents, args.parts, args.output_dir), ensure_ascii=False))
-        print('Prepared:', args.output_dir / 'rules.jsonl')
-        return 0
+    from .hf_database import require_corpus
+    from .python_runner import run_benchmark
 
-    if args.command == 'prepare-final':
-        if not args.parts.is_file():
-            parser.error('Final legal parts JSONL does not exist')
-        try:
-            embedder = make_embedder(args.embedding_backend, args.embedding_model,
-                                     args.embedding_base_url,
-                                     os.getenv(args.embedding_api_key_env, 'dummy'), args.timeout)
-            manifest = prepare_final(args.parts, args.output_dir, embedder,
-                                     args.embedding_backend, args.embedding_model,
-                                     args.batch_size)
-        except (ValueError, ImportError, RuntimeError) as exc:
-            parser.error(str(exc))
-        print('Prepared final corpus:', args.output_dir / 'rules.jsonl')
-        print('Manifest:', json.dumps(manifest, ensure_ascii=False))
-        return 0
+    try:
+        require_corpus(args.corpus_dir)
+    except FileNotFoundError as exc:
+        parser.error(str(exc))
+    corpus = args.corpus_dir.resolve()
+    protected = {args.tasks.resolve()}
+    for name, path in (('Result output', args.output),
+                       ('Conversation output', args.conversation_output),
+                       ('Workspace root', args.workspace_root)):
+        if path is not None and (path.resolve() in protected or
+                                 path.resolve().is_relative_to(corpus)):
+            parser.error(f'{name} must differ from the tasks and corpus paths')
+    if (args.conversation_output is not None and
+            args.conversation_output.resolve() == args.output.resolve()):
+        parser.error('Conversation output must differ from result output')
 
-    if args.command == 'prepare-hf-documents':
-        from datasets import load_dataset
-        from huggingface_hub import HfApi
-        from .hf_documents import prepare_document_rows, upload_document_corpus
-
-        if args.upload and (not args.repo_id or args.max_rows is not None):
-            parser.error('--upload requires --repo-id and cannot be combined with --max-rows')
-        if min(args.batch_size, args.shard_rows, args.vector_dim) < 1:
-            parser.error('--batch-size, --shard-rows, and --vector-dim must be positive')
-        token = os.getenv(args.hf_token_env)
-        revision = HfApi(token=token).dataset_info(args.source_repo,
-                                                  revision=args.revision).sha
-        dataset = load_dataset(args.source_repo, split=args.split, revision=revision,
-                               streaming=True, token=token)
-        embedder = make_embedder('api', args.embedding_model, args.embedding_base_url,
-                                 os.getenv(args.embedding_api_key_env, 'dummy'), args.timeout)
-        manifest = prepare_document_rows(
-            dataset, args.output_dir, embedder, source_repo=args.source_repo,
-            source_revision=revision, split=args.split,
-            embedding_model=args.embedding_model, batch_size=args.batch_size,
-            shard_rows=args.shard_rows, vector_dim=args.vector_dim,
-            max_rows=args.max_rows)
-        print('Prepared:', json.dumps(manifest, ensure_ascii=False))
-        if args.upload:
-            result = upload_document_corpus(args.output_dir, args.repo_id,
-                                            token=token, private=args.private)
-            print('Uploaded:', result)
-        return 0
-
-    if args.command == 'search-hf-documents':
-        from .hf_documents import search_document_index
-
-        manifest = json.loads((args.prepared_dir / 'manifest.json').read_text(encoding='utf-8'))
-        embedder = make_embedder('api', manifest['embedding_model'],
-                                 args.embedding_base_url,
-                                 os.getenv(args.embedding_api_key_env, 'dummy'), args.timeout)
-        print(json.dumps(search_document_index(args.prepared_dir, embedder,
-                                               args.query, args.top_k), ensure_ascii=False, indent=2))
-        return 0
-
-    if args.command == 'embed':
-        if not (args.rules_dir / 'rules.jsonl').is_file():
-            parser.error('Prepared rules missing; run prepare first')
-        if args.embedding_backend == 'hash':
-            print('WARNING: hash vectors are only for offline plumbing tests.')
-        try:
-            embedder = make_embedder(args.embedding_backend, args.embedding_model,
-                                     args.embedding_base_url,
-                                     os.getenv(args.embedding_api_key_env, 'dummy'), args.timeout)
-            manifest = build_vectors(args.rules_dir, args.index_dir, embedder,
-                                     args.embedding_backend, args.embedding_model,
-                                     args.batch_size, args.chunk_chars, args.overlap,
-                                     args.passage_prefix, args.query_prefix)
-        except (ValueError, ImportError, RuntimeError) as exc:
-            parser.error(str(exc))
-        print('Index:', json.dumps(manifest, ensure_ascii=False))
-        return 0
-
-    if args.command in ('run-python', 'run-dsh'):
-        from .python_runner import run_benchmark
-        if not args.final_dir:
-            parser.error('--final-dir is required for the direct Python runner')
-        if args.final_dir:
-            args.rules_dir = args.index_dir = args.final_dir
-        if not args.tasks.is_file() or not (args.rules_dir / 'rules.jsonl').is_file():
-            parser.error('Tasks or prepared rules missing; run prepare first')
-        if not (args.index_dir / 'manifest.json').is_file():
-            parser.error('Vector index missing; run embed first')
-        if args.max_steps < 1 or args.max_tokens < 1 or args.context_window < 4096:
-            parser.error('--max-steps and --max-tokens must be positive; --context-window >= 4096')
-        if args.max_tokens >= args.context_window:
-            parser.error('--max-tokens must be smaller than --context-window')
-        if not 1 <= args.request_timeout <= 3600:
-            parser.error('--request-timeout must be between 1 and 3600 seconds')
-        if args.max_rules is not None and args.max_rules < 1:
-            parser.error('--max-rules must be positive')
-        protected = {args.tasks.resolve(), (args.rules_dir / 'rules.jsonl').resolve(),
-                     (args.index_dir / 'index.faiss').resolve(),
-                     (args.index_dir / 'manifest.json').resolve()}
-        if args.output.resolve() in protected:
-            parser.error('Result output must differ from tasks, rules, and index')
-        if args.conversation_output and args.conversation_output.resolve() in protected:
-            parser.error('Conversation output must differ from tasks, rules, and index')
-        if args.conversation_output and args.conversation_output.resolve() == args.output.resolve():
-            parser.error('Conversation output must differ from result output')
-        summary = run_benchmark(args.tasks, args.output,
-                      conversation_output=args.conversation_output,
-                      final_dir=args.final_dir, workspace_root=args.workspace_root,
-                      base_url=args.base_url, model=args.model,
-                      api_key=os.getenv(args.api_key_env, 'dummy'),
-                      max_steps=args.max_steps, max_tokens=args.max_tokens,
-                      embedding_base_url=args.embedding_base_url,
-                      embedding_api_key=os.getenv(args.embedding_api_key_env, 'dummy'),
-                      request_timeout=args.request_timeout, debug=args.debug,
-                      verbosity=args.verbosity, max_rules=args.max_rules,
-                      search_threads=args.search_threads)
-        return 1 if any(summary['statuses'].get(status, 0) for status in
-                        ('llm_error', 'runtime_error', 'error', 'no_finish_reason')) else 0
-
-    if args.command == 'demo':
-        if not args.documents.is_file() or not args.parts.is_file() or not args.tasks.is_file():
-            parser.error('Demo source JSONL or tasks file missing')
-        rules_dir, index_dir = args.output_dir / 'prepared', args.output_dir / 'index'
-        result_path, workspace = args.output_dir / 'results.jsonl', args.output_dir / 'workspaces'
-        print('Prepared:', json.dumps(prepare(args.documents, args.parts, rules_dir), ensure_ascii=False))
-        print('Index:', json.dumps(build_vectors(rules_dir, index_dir, make_embedder('hash'), 'hash'),
-                                   ensure_ascii=False))
-        client = DemoClient()
-        embedder = make_embedder('hash')
-    else:
-        if not args.tasks.is_file() or not (args.rules_dir / 'rules.jsonl').is_file():
-            parser.error('Tasks or prepared rules missing; run prepare first')
-        if args.max_steps < 1:
-            parser.error('--max-steps must be positive')
-        try:
-            extra = json.loads(args.extra_body)
-        except json.JSONDecodeError as exc:
-            parser.error(f'--extra-body must be JSON: {exc}')
-        if not isinstance(extra, dict):
-            parser.error('--extra-body must be a JSON object')
-        manifest_path = args.index_dir / 'manifest.json'
-        if not manifest_path.is_file():
-            parser.error('Vector index missing; run embed first')
-        manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
-        try:
-            embedder = make_embedder(manifest['backend'], manifest['embedding_model'],
-                         args.embedding_base_url, os.getenv(args.embedding_api_key_env, 'dummy'), args.timeout)
-        except (ValueError, ImportError) as exc:
-            parser.error(str(exc))
-        client = OpenAICompatibleClient(args.base_url, args.model,
-                         api_key=os.getenv(args.api_key_env, 'dummy'), timeout=args.timeout,
-                         extra_body=extra)
-        rules_dir, index_dir = args.rules_dir, args.index_dir
-        result_path, workspace = args.output, args.workspace_root
-
-    protected = {args.tasks.resolve(), (rules_dir / 'rules.jsonl').resolve(),
-                 (index_dir / 'index.faiss').resolve(), (index_dir / 'manifest.json').resolve()}
-    if result_path.resolve() in protected:
-        parser.error('Result output must differ from tasks, rules, and index')
-    result_path.parent.mkdir(parents=True, exist_ok=True)
-    results = []
-    with VectorRuleDatabase(rules_dir, index_dir, embedder) as database, private_text_output(result_path) as output:
-        for task in rows(args.tasks):
-            result = run_task(task, database, client,
-                              max_steps=args.max_steps if args.command == 'run' else 8,
-                              workspace_root=workspace)
-            output.write(json.dumps(result, ensure_ascii=False) + '\n')
-            output.flush()
-            results.append({'metrics': result['metrics']})
-            print(f"{result['id']}: {result['status']}, F1={result['metrics'].get('f1', 'n/a')}, "
-                  f"tools={result['metrics']['tool_calls']}")
-    print('Aggregate:', json.dumps(aggregate(results), ensure_ascii=False))
-    print('Trace:', result_path)
-    return 0
+    summary = run_benchmark(
+        args.tasks, args.output, corpus_dir=args.corpus_dir,
+        conversation_output=args.conversation_output,
+        workspace_root=args.workspace_root, base_url=args.base_url, model=args.model,
+        api_key=os.getenv(args.api_key_env, 'dummy'),
+        embedding_base_url=args.embedding_base_url,
+        embedding_api_key=os.getenv(args.embedding_api_key_env, 'dummy'),
+        max_steps=args.max_steps, max_tokens=args.max_tokens,
+        request_timeout=args.request_timeout, debug=args.debug,
+        verbosity=args.verbosity, search_threads=args.search_threads)
+    return 1 if any(summary['statuses'].get(status, 0) for status in
+                    ('llm_error', 'runtime_error', 'error', 'no_finish_reason')) else 0
 
 
 if __name__ == '__main__':
